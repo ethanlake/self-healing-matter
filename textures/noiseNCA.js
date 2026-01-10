@@ -429,6 +429,8 @@ const PROGRAMS = {
     }`,
     update: `
     ${defInput('u_update')}
+    uniform sampler2D u_dropoutMask;
+    uniform vec2 u_dropoutMask_size;
     uniform float u_seed, u_updateProbability, u_epsilon;
     uniform float u_dt;
     varying vec2 uv;
@@ -450,16 +452,24 @@ const PROGRAMS = {
         }
       #else
         // if (hash13(vec3(xy, u_seed)) <= u_updateProbability) {
-        update = u_update_readUV(uv);    
+        update = u_update_readUV(uv);
         // }
       #endif
       highp vec4 noise = (hash44(vec4(xy, ch, u_seed)) - 0.5) * u_epsilon;  // uniform on [-ε/2, ε/2]
       highp vec4 newState = state + u_dt * ((1.0 - u_epsilon) * update + noise);
+
+      // Apply channel dropout mask
+      float ch4 = ch;
+      vec4 maskVec = texture2D(u_dropoutMask, vec2((ch4 + 0.5) / u_dropoutMask_size.x, 0.5));
+      newState = newState * maskVec;  // Multiply by mask (0.0 = dropped out)
+
       setOutput(newState);
     }`,
     blendedUpdate: `
     ${defInput('u_update')}
     ${defInput('u_altUpdate')}
+    uniform sampler2D u_dropoutMask;
+    uniform vec2 u_dropoutMask_size;
     uniform float u_seed, u_updateProbability, u_epsilon;
     uniform float u_dt;
     uniform float u_blendFactor;
@@ -475,6 +485,12 @@ const PROGRAMS = {
       highp vec4 blendedUpdate = mix(update1, update2, u_blendFactor);
       highp vec4 noise = (hash44(vec4(xy, ch, u_seed)) - 0.5) * u_epsilon;  // uniform on [-ε/2, ε/2]
       highp vec4 newState = state + u_dt * ((1.0 - u_epsilon) * blendedUpdate + noise);
+
+      // Apply channel dropout mask
+      float ch4 = ch;
+      vec4 maskVec = texture2D(u_dropoutMask, vec2((ch4 + 0.5) / u_dropoutMask_size.x, 0.5));
+      newState = newState * maskVec;  // Multiply by mask (0.0 = dropped out)
+
       setOutput(newState);
     }`,
     vis: `
@@ -732,6 +748,30 @@ function createDenseInfo(gl, params) {
     return info;
 }
 
+function createDropoutMaskTexture(gl, channelCount, mask) {
+    // Pack mask into RGBA texture (4 channels per pixel)
+    const width = Math.ceil(channelCount / 4);
+    const data = new Float32Array(width * 4);
+
+    for (let i = 0; i < channelCount; i++) {
+        data[i] = mask[i];
+    }
+    // Pad remaining with 1.0 (active)
+    for (let i = channelCount; i < width * 4; i++) {
+        data[i] = 1.0;
+    }
+
+    return twgl.createTexture(gl, {
+        minMag: gl.NEAREST,
+        src: data,
+        width: width,
+        height: 1,
+        internalFormat: gl.RGBA32F,
+        format: gl.RGBA,
+        type: gl.FLOAT,
+    });
+}
+
 export class NoiseNCA {
     constructor(gl, models, gridSize, gui) {
         // models is basically the json file
@@ -779,6 +819,15 @@ export class NoiseNCA {
         this.pruningMask = [];              // Uint8Array for each layer (1=prune, 0=keep)
         this.pruningIndices = [];           // Sorted global indices for debugging
         this.weightPruningFraction = 0.0;   // Pruning fraction (0.0-1.0)
+
+        // Neuron pruning system
+        this.neuronPruningMask = [];            // Uint8Array for each layer
+        this.neuronPruningFraction = 0.0;       // Neuron pruning fraction (0.0-1.0)
+        this.prunedNeuronIndices = [];          // Indices of pruned neurons for debugging
+
+        // Channel dropout system
+        this.channelDropoutMask = null;         // Float32Array, length = channelCount, 1.0=active, 0.0=dropped
+        this.dropoutMaskTex = null;             // Texture containing dropout mask
 
         this.setWeights(models);
 
@@ -867,6 +916,10 @@ export class NoiseNCA {
         const lastLayer = this.layers[this.layers.length - 1];
         const channel_n = lastLayer.out_n;
         this.channelCount = channel_n;  // Store for external access
+
+        // Initialize channel dropout mask (all active by default)
+        this.channelDropoutMask = new Float32Array(channel_n).fill(1.0);
+
         const stateQuantization = lastLayer.quantScaleZero;
         const no_quantization = [1.0, 0.0];
         this.buf = {
@@ -876,6 +929,9 @@ export class NoiseNCA {
             perception0: createTensor(gl, gridW, updateH, perception_n, no_quantization, true),
 
         };
+
+        // Create dropout mask texture
+        this.dropoutMaskTex = createDropoutMaskTexture(gl, channel_n, this.channelDropoutMask);
 
 
         // For now we only support multi-scale perception with 2 scales
@@ -944,14 +1000,18 @@ export class NoiseNCA {
                     u_input: this.buf.state, u_update: inputBuf, u_altUpdate: altInputBuf,
                     u_unshuffleTex: this.unshuffleTex, u_dt: this.dt, u_epsilon: this.epsilon,
                     u_seed: seed, u_updateProbability: this.updateProbability,
-                    u_blendFactor: this.blendFactor
+                    u_blendFactor: this.blendFactor,
+                    u_dropoutMask: this.dropoutMaskTex,
+                    u_dropoutMask_size: [Math.ceil(this.channelCount / 4), 1]
                 });
             } else {
                 // Use regular update shader (no blending)
                 this.runLayer(this.progs.update, this.buf.newState, {
                     u_input: this.buf.state, u_update: inputBuf,
                     u_unshuffleTex: this.unshuffleTex, u_dt: this.dt, u_epsilon: this.epsilon,
-                    u_seed: seed, u_updateProbability: this.updateProbability
+                    u_seed: seed, u_updateProbability: this.updateProbability,
+                    u_dropoutMask: this.dropoutMaskTex,
+                    u_dropoutMask_size: [Math.ceil(this.channelCount / 4), 1]
                 });
             }
         }
@@ -959,6 +1019,20 @@ export class NoiseNCA {
         if (stage == 'all') {
             [this.buf.state, this.buf.newState] = [this.buf.newState, this.buf.state];
         }
+    }
+
+    updateChannelDropout(channelIndex, isActive) {
+        // Update mask array
+        this.channelDropoutMask[channelIndex] = isActive ? 1.0 : 0.0;
+
+        // Recreate texture
+        const gl = this.gl;
+        if (this.dropoutMaskTex) {
+            gl.deleteTexture(this.dropoutMaskTex);
+        }
+        this.dropoutMaskTex = createDropoutMaskTexture(gl, this.channelCount, this.channelDropoutMask);
+
+        console.log(`Channel ${channelIndex} ${isActive ? 'enabled' : 'dropped out'}`);
     }
 
     benchmark() {
@@ -1051,16 +1125,22 @@ export class NoiseNCA {
         this.originalModels = this.deepCloneModels(models);
         this.generatePerturbationVectors(models);
         this.generatePruningMask(models, this.weightPruningFraction);
+        this.generateNeuronPruningMask(models, this.neuronPruningFraction);
 
-        // Apply transformations in order: pruning first, then perturbations
+        // Apply transformations in order: neuron pruning, weight pruning, then perturbations
         let modelsToUse = models;
 
-        // Step 1: Apply pruning if active
+        // Step 1: Apply neuron pruning if active
+        if (this.neuronPruningFraction > 0) {
+            modelsToUse = this.applyNeuronPruning(modelsToUse);
+        }
+
+        // Step 2: Apply weight pruning if active
         if (this.weightPruningFraction > 0) {
             modelsToUse = this.applyPruning(modelsToUse);
         }
 
-        // Step 2: Apply perturbations if active
+        // Step 3: Apply perturbations if active
         if (this.weightPerturbation > 0) {
             modelsToUse = this.applyPerturbations(modelsToUse, this.weightPerturbation);
         }
@@ -1198,8 +1278,12 @@ export class NoiseNCA {
         if (this.originalModels) {
             const gl = this.gl;
 
-            // Apply transformations in order: pruning first, then perturbations
+            // Apply transformations in order: neuron pruning, weight pruning, then perturbations
             let modelsToUse = this.originalModels;
+
+            if (this.neuronPruningFraction > 0) {
+                modelsToUse = this.applyNeuronPruning(modelsToUse);
+            }
 
             if (this.weightPruningFraction > 0) {
                 modelsToUse = this.applyPruning(modelsToUse);
@@ -1367,6 +1451,145 @@ export class NoiseNCA {
         }
     }
 
+    generateNeuronPruningMask(models, fraction) {
+        // Reset neuron pruning data structures
+        this.neuronPruningMask = [];
+        this.prunedNeuronIndices = [];
+
+        if (fraction <= 0) {
+            // No neuron pruning - initialize empty masks
+            for (let i = 0; i < models.layers.length; i++) {
+                const layer = models.layers[i];
+                if (layer.data_flatten) {
+                    this.neuronPruningMask.push(new Uint8Array(layer.data_flatten.length));
+                } else {
+                    this.neuronPruningMask.push(null);
+                }
+            }
+            return;
+        }
+
+        // First pass: compute W1 column norms (input weights for each neuron)
+        let w1ColNorms = null;
+        if (models.layers[0] && models.layers[0].data_flatten) {
+            const layer0 = models.layers[0];
+            const data0 = layer0.data_flatten;
+            const [rows0, cols0] = layer0.shape;  // [49, 96] including bias row
+            const scale0 = layer0.scale || 1.0;
+            const center0 = layer0.center || 0.0;
+            const numInputRows = rows0 - 1;  // Exclude bias row (48 input rows)
+            const numNeurons = cols0;  // 96 neurons
+
+            w1ColNorms = new Array(numNeurons);
+            for (let neuronIdx = 0; neuronIdx < numNeurons; neuronIdx++) {
+                let sumSquares = 0;
+                // Sum over input rows (excluding bias row)
+                for (let inRow = 0; inRow < numInputRows; inRow++) {
+                    const flatIdx = inRow * cols0 + neuronIdx;  // Row-major: column index
+                    const quantized = data0[flatIdx];
+                    const real = (quantized - center0) * scale0;  // DEQUANTIZE
+                    sumSquares += real * real;
+                }
+                w1ColNorms[neuronIdx] = Math.sqrt(sumSquares);
+            }
+        }
+
+        // Second pass: compute neuron masks based on combined norms
+        for (let layerIdx = 0; layerIdx < models.layers.length; layerIdx++) {
+            const layer = models.layers[layerIdx];
+
+            if (!layer.data_flatten) {
+                this.neuronPruningMask.push(null);
+                continue;
+            }
+
+            const mask = new Uint8Array(layer.data_flatten.length);
+
+            // Only prune neurons in Layer 1 (W2)
+            if (layerIdx === 1) {
+                const data = layer.data_flatten;
+                const [numNeurons, outDim] = layer.shape;  // [96, 12]
+                const scale = layer.scale || 1.0;
+                const center = layer.center || 0.0;
+
+                // Compute L2 norms for each neuron (row of W2 - output weights)
+                const neuronNorms = [];
+                for (let neuronIdx = 0; neuronIdx < numNeurons; neuronIdx++) {
+                    let sumSquares = 0;
+                    for (let outIdx = 0; outIdx < outDim; outIdx++) {
+                        const flatIdx = neuronIdx * outDim + outIdx;  // Row-major indexing
+                        const quantized = data[flatIdx];
+                        const real = (quantized - center) * scale;  // DEQUANTIZE
+                        sumSquares += real * real;
+                    }
+                    const w2Norm = Math.sqrt(sumSquares);
+
+                    // Combine W1 column norm (input) and W2 row norm (output)
+                    const combinedNorm = w1ColNorms ? (w1ColNorms[neuronIdx] + w2Norm) : w2Norm;
+
+                    neuronNorms.push({
+                        norm: combinedNorm,
+                        w1Norm: w1ColNorms ? w1ColNorms[neuronIdx] : 0,
+                        w2Norm: w2Norm,
+                        neuronIdx: neuronIdx
+                    });
+                }
+
+                // Sort by L2 norm (ascending - smallest first)
+                neuronNorms.sort((a, b) => a.norm - b.norm);
+
+                // Calculate number of neurons to prune
+                const numToPrune = Math.round(fraction * numNeurons);
+
+                console.log(`Neuron Pruning (Combined): ${numToPrune} / ${numNeurons} neurons (${(fraction * 100).toFixed(1)}%)`);
+
+                if (numToPrune > 0) {
+                    const smallest = neuronNorms[0];
+                    const largestPruned = neuronNorms[numToPrune - 1];
+                    console.log(`  Smallest combined norm: ${smallest.norm.toFixed(6)} (W1: ${smallest.w1Norm.toFixed(6)}, W2: ${smallest.w2Norm.toFixed(6)})`);
+                    console.log(`  Largest pruned norm: ${largestPruned.norm.toFixed(6)} (W1: ${largestPruned.w1Norm.toFixed(6)}, W2: ${largestPruned.w2Norm.toFixed(6)})`);
+
+                    // Create set of pruned neuron indices
+                    const prunedSet = new Set();
+                    for (let i = 0; i < numToPrune; i++) {
+                        prunedSet.add(neuronNorms[i].neuronIdx);
+                    }
+
+                    // Mark all weights in pruned neuron rows
+                    for (let neuronIdx = 0; neuronIdx < numNeurons; neuronIdx++) {
+                        if (prunedSet.has(neuronIdx)) {
+                            for (let outIdx = 0; outIdx < outDim; outIdx++) {
+                                const flatIdx = neuronIdx * outDim + outIdx;
+                                mask[flatIdx] = 1;
+                            }
+                        }
+                    }
+
+                    // Store pruned neuron indices for debugging
+                    this.prunedNeuronIndices = Array.from(prunedSet).sort((a, b) => a - b);
+
+                    // Also need to mark corresponding W1 columns (Layer 0)
+                    // Go back and update Layer 0 mask if it exists
+                    if (this.neuronPruningMask.length > 0 && this.neuronPruningMask[0]) {
+                        const layer0 = models.layers[0];
+                        const mask0 = this.neuronPruningMask[0];
+                        const [rows0, cols0] = layer0.shape;  // [49, 96]
+
+                        // Mark all elements in the pruned columns (for all rows)
+                        for (let neuronIdx of prunedSet) {
+                            for (let row = 0; row < rows0; row++) {
+                                const flatIdx = row * cols0 + neuronIdx;
+                                mask0[flatIdx] = 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            this.neuronPruningMask.push(mask);
+        }
+    }
+
     applyPruning(models) {
         // Clone the models
         const pruned = this.deepCloneModels(models);
@@ -1393,6 +1616,32 @@ export class NoiseNCA {
         return pruned;
     }
 
+    applyNeuronPruning(models) {
+        // Clone the models
+        const pruned = this.deepCloneModels(models);
+
+        // Apply neuron pruning mask to each layer
+        for (let i = 0; i < pruned.layers.length; i++) {
+            const layer = pruned.layers[i];
+            const mask = this.neuronPruningMask[i];
+
+            if (layer.data_flatten && mask) {
+                // CRITICAL: Set to center for true zero in dequantized space
+                // Because: real_value = (quantized_value - center) * scale
+                // So: 0 = (center - center) * scale
+                const center = layer.center || 0.0;
+
+                for (let j = 0; j < layer.data_flatten.length; j++) {
+                    if (mask[j] === 1) {
+                        layer.data_flatten[j] = center;  // Set to center, NOT 0.0!
+                    }
+                }
+            }
+        }
+
+        return pruned;
+    }
+
     updatePruningFraction(fraction) {
         this.weightPruningFraction = fraction;
 
@@ -1402,8 +1651,12 @@ export class NoiseNCA {
             // Regenerate pruning mask with new fraction
             this.generatePruningMask(this.originalModels, fraction);
 
-            // Apply transformations in order: pruning first, then perturbations
+            // Apply transformations in order: neuron pruning, weight pruning, then perturbations
             let modelsToUse = this.originalModels;
+
+            if (this.neuronPruningFraction > 0) {
+                modelsToUse = this.applyNeuronPruning(modelsToUse);
+            }
 
             if (fraction > 0) {
                 modelsToUse = this.applyPruning(modelsToUse);
@@ -1424,6 +1677,44 @@ export class NoiseNCA {
             console.log('Resetting pruning mask...');
             this.generatePruningMask(this.originalModels, this.weightPruningFraction);
             this.updatePruningFraction(this.weightPruningFraction);
+        }
+    }
+
+    updateNeuronPruningFraction(fraction) {
+        this.neuronPruningFraction = fraction;
+
+        if (this.originalModels) {
+            const gl = this.gl;
+
+            // Regenerate neuron pruning mask with new fraction
+            this.generateNeuronPruningMask(this.originalModels, fraction);
+
+            // Apply transformations in order: neuron pruning, weight pruning, then perturbations
+            let modelsToUse = this.originalModels;
+
+            if (fraction > 0) {
+                modelsToUse = this.applyNeuronPruning(modelsToUse);
+            }
+
+            if (this.weightPruningFraction > 0) {
+                modelsToUse = this.applyPruning(modelsToUse);
+            }
+
+            if (this.weightPerturbation > 0) {
+                modelsToUse = this.applyPerturbations(modelsToUse, this.weightPerturbation);
+            }
+
+            // Recreate GPU textures
+            this.layers.forEach(layer => { if (layer.tex) gl.deleteTexture(layer.tex); });
+            this.layers = modelsToUse.layers.map(layer => createDenseInfo(gl, layer));
+        }
+    }
+
+    resetNeuronPruning() {
+        if (this.originalModels) {
+            console.log('Resetting neuron pruning mask...');
+            this.generateNeuronPruningMask(this.originalModels, this.neuronPruningFraction);
+            this.updateNeuronPruningFraction(this.neuronPruningFraction);
         }
     }
 

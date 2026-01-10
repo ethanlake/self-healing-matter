@@ -91,6 +91,9 @@ export function createDemo(divId) {
         // Weight pruning
         weightPruningFraction: 0.0,
 
+        // Neuron pruning
+        neuronPruningFraction: 0.0,
+
         texture_img: null,
 
         texture_idx: 0,
@@ -325,27 +328,68 @@ export function createDemo(divId) {
         ca.blendFactor = params.blendFactor;
         ca.invertColors = params.invertColors;
         ca.weightPruningFraction = params.weightPruningFraction;
+        ca.neuronPruningFraction = params.neuronPruningFraction;
 
-        // Populate channel selector with hidden channels
-        populateChannelSelector();
+        // Populate channel checkboxes with RGB and hidden channels
+        populateChannelCheckboxes();
     }
 
-    function populateChannelSelector() {
-        const select = $('#channelSelect');
-        // Remove existing hidden channel options (keep RGB and grayscale)
-        while (select.options.length > 2) {
-            select.remove(2);
+    function populateChannelCheckboxes() {
+        const container = $('#channelCheckboxes');
+        container.innerHTML = '';  // Clear existing
+
+        if (!ca || !ca.channelCount) return;
+
+        const channelCount = ca.channelCount;
+
+        // RGB channels (0, 1, 2)
+        const rgbLabels = ['R', 'G', 'B'];
+        for (let i = 0; i < 3; i++) {
+            addChannelCheckbox(container, i, rgbLabels[i]);
         }
-        // Add hidden channel options (channels 3 to channelCount-1)
-        if (ca && ca.channelCount) {
-            const numHidden = ca.channelCount - 3;  // subtract RGB channels
-            for (let i = 0; i < numHidden; i++) {
-                const option = document.createElement('option');
-                option.value = (3 + i).toString();  // channel index starts at 3
-                option.text = `Hidden ${i + 1}`;
-                select.add(option);
+
+        // Hidden channels (3, 4, 5, ...)
+        const numHidden = channelCount - 3;
+        for (let i = 0; i < numHidden; i++) {
+            const channelIdx = 3 + i;
+            const label = `H${i + 1}`;
+            addChannelCheckbox(container, channelIdx, label);
+        }
+    }
+
+    function addChannelCheckbox(container, channelIdx, labelText) {
+        const item = document.createElement('div');
+        item.className = 'channel-checkbox-item';
+
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.id = `channel-${channelIdx}`;
+        checkbox.checked = true;  // All active by default
+        checkbox.onchange = () => {
+            if (ca) {
+                ca.updateChannelDropout(channelIdx, checkbox.checked);
             }
-        }
+        };
+
+        const label = document.createElement('label');
+        label.htmlFor = `channel-${channelIdx}`;
+        label.className = 'channel-checkbox-label';
+        label.textContent = labelText;
+        label.onclick = (e) => {
+            e.preventDefault();  // Don't trigger checkbox
+            // Switch visualization to this channel
+            if (channelIdx < 3) {
+                // RGB channel - show RGB mode
+                params.viewChannel = -1.0;
+            } else {
+                // Hidden channel - show this specific channel
+                params.viewChannel = channelIdx;
+            }
+        };
+
+        item.appendChild(checkbox);
+        item.appendChild(label);
+        container.appendChild(item);
     }
 
 
@@ -610,6 +654,25 @@ export function createDemo(divId) {
             }
         };
 
+        // Neuron pruning fraction slider
+        const updateNeuronPruningFraction = () => {
+            const val = parseFloat($('#neuronPruningFraction').value);
+            $('#neuronPruningFractionLabel').textContent = val.toFixed(2);
+            params.neuronPruningFraction = val;
+            if (ca) {
+                ca.updateNeuronPruningFraction(val);
+            }
+        };
+        $('#neuronPruningFraction').onchange = updateNeuronPruningFraction;
+        $('#neuronPruningFraction').oninput = updateNeuronPruningFraction;
+
+        // Reset neuron pruning button
+        $('#resetNeuronPruning').onclick = () => {
+            if (ca) {
+                ca.resetNeuronPruning();
+            }
+        };
+
         // Alt texture checkbox - toggles which texture is being selected
         $('#altTexture').onchange = () => {
             selectingAltTexture = $('#altTexture').checked;
@@ -621,19 +684,6 @@ export function createDemo(divId) {
             params.invertColors = $('#invertColors').checked;
             if (ca) {
                 ca.invertColors = params.invertColors;
-            }
-        };
-
-        // Channel view selector
-        $('#channelSelect').onchange = () => {
-            const val = $('#channelSelect').value;
-            if (val === 'rgb') {
-                params.viewChannel = -1.0;
-            } else if (val === 'grayscale') {
-                params.viewChannel = -2.0;
-            } else {
-                // Hidden channel: value is the channel index (3, 4, 5, ...)
-                params.viewChannel = parseFloat(val);
             }
         };
 

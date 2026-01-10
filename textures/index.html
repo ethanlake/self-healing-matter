@@ -63,6 +63,39 @@
         MathJax.Hub.Config({tex2jax: {inlineMath: [['$','$'], ['\\(','\\)']]}});
     </script>
 
+    <style>
+        #channelCheckboxes {
+            display: flex;
+            flex-wrap: wrap;
+            flex-direction: row;
+            justify-content: flex-start;
+            align-items: center;
+            gap: 8px 12px;
+            margin: 5px 0;
+            width: 100%;
+        }
+
+        .channel-checkbox-item {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            flex-shrink: 0;
+        }
+
+        .channel-checkbox-label {
+            cursor: pointer;
+            user-select: none;
+            font-size: 12px;
+            font-weight: bold;
+            color: #333;
+            white-space: nowrap;
+        }
+
+        .channel-checkbox-label:hover {
+            color: #007bff;
+        }
+    </style>
+
 </head>
 
 <svg style="display: none;" xmlns="http://www.w3.org/2000/svg">
@@ -211,51 +244,24 @@
 
                             <input type="range" id="epsilon" min="0.0" max="1.0" step="0.001" value="0.0"></br>$\epsilon = $
                             <label id="epsilonLabel"></label>
-                        </div>
 
-                        <div id="viewChannelSelect" class="button-group" style="text-align: center;">
-                            <select id="channelSelect" style="padding: 4px; font-size: 12px;">
-                                <option value="rgb">RGB</option>
-                                <option value="grayscale">Grayscale</option>
-                            </select>
-                            <br>View Channel
+                            <input type="range" id="rotation" min="0" max="360" step="1" value="0"></br>Rotation: <label
+                                id="rotationLabel"></label><br>
+                            <input type="range" id="resolution" min="-2" max="2" step="1" value="0"></br>Resolution:
+                            <label id="resolutionLabel"></label>
+
+                            <br>
+                            <div id="channelCheckboxes">
+                                <!-- Dynamically populated by JavaScript -->
+                            </div>
                         </div>
 
                         <div>
                             <!-- Empty placeholder for grid alignment -->
                         </div>
 
-                        <div id='alignSelect' class="button-group">
-                            <label>
-                                <input type="radio" checked="checked" name="align"><img
-                                    src="data/images/icons.svg#alignRegular" />
-                            </label>
-                            <label>
-                                <input type="radio" name="align"><img src="data/images/icons.svg#alignPolar" />
-                            </label>
-                            <label>
-                                <input type="radio" name="align"><img src="data/images/icons.svg#alignDipole" />
-                            </label>
-                            <br>Cell Alignment
-                        </div>
-                        <!--                        <div id='configSelect' class="button-group">-->
-                        <!--                            <label>-->
-                        <!--                                <input type="radio" name="config"><img-->
-                        <!--                                    src="data/images/config_S.png" width="38px" height="38px"/>-->
-                        <!--                            </label>-->
-                        <!--                            <label>-->
-                        <!--                                <input type="radio" name="config" checked="checked"><img src="data/images/config_L.png"-->
-                        <!--                                                                                         width="38px"-->
-                        <!--                                                                                         height="38px"/>-->
-                        <!--                            </label>-->
-                        <!--                            <br>NoiseNCA Config-->
-                        <!--                        </div>-->
-
                         <div>
-                            <input type="range" id="rotation" min="0" max="360" step="1" value="0"></br>Rotation: <label
-                                id="rotationLabel"></label><br>
-                            <input type="range" id="resolution" min="-2" max="2" step="1" value="0"></br>Resolution:
-                            <label id="resolutionLabel"></label>
+                            <!-- Empty placeholder for grid alignment -->
                         </div>
                         <!--            <div id='RotPosEmb' class="button-group">-->
                         <!--                <label>-->
@@ -270,13 +276,20 @@
                     <br>
                     <div id="demo-tip">
 
-                        <img id="pointer" src="data/images/pointer.svg">
-                        <div class="hint ">
-                            Click or tap the image to erase parts of the pattern.
-
+                        <div id='alignSelect' class="button-group" style="margin-top: 15px;">
+                            <label>
+                                <input type="radio" checked="checked" name="align"><img
+                                    src="data/images/icons.svg#alignRegular" />
+                            </label>
+                            <label>
+                                <input type="radio" name="align"><img src="data/images/icons.svg#alignPolar" />
+                            </label>
+                            <label>
+                                <input type="radio" name="align"><img src="data/images/icons.svg#alignDipole" />
+                            </label>
+                            <br>Cell Alignment
                         </div>
 
-                    
                     </div>
                     <div class="is-left has-text-left">
                         <p style="font-size: 10pt">
@@ -337,6 +350,15 @@
                         <label>
                             <button id="resetPruning" style="padding: 4px 12px; cursor: pointer;">
                                 Reset Pruning
+                            </button>
+                        </label>
+                        <label style="display: flex; align-items: center; gap: 8px;">
+                            Pruned Neuron Fraction: <input type="range" id="neuronPruningFraction" min="0" max="1" step="0.01" value="0" style="width: 100px;">
+                            <span id="neuronPruningFractionLabel">0.00</span>
+                        </label>
+                        <label>
+                            <button id="resetNeuronPruning" style="padding: 4px 12px; cursor: pointer;">
+                                Reset Neuron Pruning
                             </button>
                         </label>
                     </div>

@@ -3,13 +3,18 @@
 Visualize weight distributions in NCA models.
 
 Usage:
-    python visualize_weights.py <weights_file.pt>
+    python visualize_weights.py <weights_file.pt> [-combined]
     python visualize_weights.py trained_models/Vanilla-NCA/bubbly_0117/weights.pt
+    python visualize_weights.py trained_models/Vanilla-NCA/bubbly_0117/weights.pt -combined
 
 This script loads a PyTorch .pt file and plots histograms of:
 - W1 weights (first dense layer)
 - W2 weights (second dense layer)
-- Biases (from first layer)
+- Hidden neuron strengths (W2 column norms, or combined W1+W2 with -combined flag)
+
+Options:
+    -combined    Compute neuron strength as ||W1_row||_2 + ||W2_col||_2
+                 This weights neurons by both input and output connection strengths
 
 Requirements:
     pip install torch matplotlib numpy
@@ -72,16 +77,30 @@ def extract_weight_components(state_dict):
     return w1, b1, w2
 
 
-def plot_weight_distributions(w1, b1, w2, pt_file):
+def plot_weight_distributions(w1, b1, w2, pt_file, combined=False):
     """Plot histograms of weight magnitudes."""
     # Flatten weights
     w1_flat = w1.flatten()
     w2_flat = w2.flatten()
     b1_flat = b1.flatten()
 
-    # Compute absolute values for weights (but not biases)
+    # Compute absolute values for weights
     w1_abs = np.abs(w1_flat)
     w2_abs = np.abs(w2_flat)
+
+    # Compute L2 norms of W2 columns (hidden neurons - output weights)
+    w2_col_norms = np.linalg.norm(w2, axis=0)  # Shape: (96,) - one norm per hidden neuron
+
+    # Compute L2 norms of W1 rows (hidden neurons - input weights)
+    w1_row_norms = np.linalg.norm(w1, axis=1)  # Shape: (96,) - one norm per hidden neuron
+
+    # Compute neuron strengths (combined or output-only)
+    if combined:
+        neuron_norms = w1_row_norms + w2_col_norms
+        norm_label = "Combined (Input + Output)"
+    else:
+        neuron_norms = w2_col_norms
+        norm_label = "Output Only"
 
     # Create figure with subplots
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
@@ -107,13 +126,13 @@ def plot_weight_distributions(w1, b1, w2, pt_file):
     axes[1].legend()
     axes[1].grid(alpha=0.3)
 
-    # Plot biases (actual values, not absolute)
-    axes[2].hist(b1_flat, bins=30, color='darkorange', alpha=0.7, edgecolor='black')
-    axes[2].set_xlabel('Bias Value')
+    # Plot neuron norms (hidden neuron strengths)
+    axes[2].hist(neuron_norms, bins=30, color='darkorange', alpha=0.7, edgecolor='black')
+    axes[2].set_xlabel('L2 Norm')
     axes[2].set_ylabel('Frequency')
-    axes[2].set_title(f'Biases (Layer 0)\n{len(b1_flat)} biases')
-    axes[2].axvline(np.mean(b1_flat), color='red', linestyle='--', linewidth=2, label=f'Mean: {np.mean(b1_flat):.4f}')
-    axes[2].axvline(np.median(b1_flat), color='darkred', linestyle='--', linewidth=2, label=f'Median: {np.median(b1_flat):.4f}')
+    axes[2].set_title(f'Hidden Neuron Strength\n{len(neuron_norms)} neurons - {norm_label}')
+    axes[2].axvline(np.mean(neuron_norms), color='red', linestyle='--', linewidth=2, label=f'Mean: {np.mean(neuron_norms):.4f}')
+    axes[2].axvline(np.median(neuron_norms), color='darkred', linestyle='--', linewidth=2, label=f'Median: {np.median(neuron_norms):.4f}')
     axes[2].legend()
     axes[2].grid(alpha=0.3)
 
@@ -153,16 +172,31 @@ def plot_weight_distributions(w1, b1, w2, pt_file):
     near_zero_w2 = np.sum(w2_abs < near_zero_threshold)
     print(f"  Near-zero (|w|<{near_zero_threshold}): {near_zero_w2} ({100*near_zero_w2/len(w2_flat):.2f}%)")
 
-    print("\nBiases (Layer 0):")
-    print(f"  Count:    {len(b1_flat)}")
-    print(f"  Shape:    {b1.shape}")
-    print(f"  Mean:     {np.mean(b1_flat):.6f}")
-    print(f"  Std:      {np.std(b1_flat):.6f}")
-    print(f"  Min:      {np.min(b1_flat):.6f}")
-    print(f"  Max:      {np.max(b1_flat):.6f}")
-    print(f"  Median:   {np.median(b1_flat):.6f}")
+    print(f"\nHidden Neuron Strengths ({norm_label}):")
+    print(f"  Count:      {len(neuron_norms)} neurons")
+    print(f"  W1 shape:   {w1.shape} (hidden neurons × inputs)")
+    print(f"  W2 shape:   {w2.shape} (outputs × hidden neurons)")
+    print(f"  Mean norm:  {np.mean(neuron_norms):.6f}")
+    print(f"  Std norm:   {np.std(neuron_norms):.6f}")
+    print(f"  Min norm:   {np.min(neuron_norms):.6f}")
+    print(f"  Max norm:   {np.max(neuron_norms):.6f}")
+    print(f"  Median norm:{np.median(neuron_norms):.6f}")
+
+    if combined:
+        print(f"\n  Component breakdown:")
+        print(f"    W1 row norms (input weights):  mean={np.mean(w1_row_norms):.6f}, std={np.std(w1_row_norms):.6f}")
+        print(f"    W2 col norms (output weights): mean={np.mean(w2_col_norms):.6f}, std={np.std(w2_col_norms):.6f}")
+
+    # Show neuron pruning thresholds at different fractions
+    sorted_norms = np.sort(neuron_norms)
+    print("\n  Neuron pruning thresholds:")
+    for frac in [0.1, 0.25, 0.5, 0.75]:
+        idx = int(frac * len(sorted_norms)) - 1
+        if idx >= 0:
+            print(f"    {frac:.0%} pruned → threshold: {sorted_norms[idx]:.6f}")
 
     print("\nTotal prunable weights: {} (W1 + W2)".format(len(w1_flat) + len(w2_flat)))
+    print("Total prunable neurons: {} (W2 columns)".format(len(neuron_norms)))
     print("Biases (excluded from pruning): {}".format(len(b1_flat)))
     print("="*60 + "\n")
 
@@ -171,12 +205,22 @@ def plot_weight_distributions(w1, b1, w2, pt_file):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python visualize_weights.py <weights_file.pt>")
+        print("Usage: python visualize_weights.py <weights_file.pt> [-combined]")
+        print("\nOptions:")
+        print("  -combined    Compute neuron strength as ||W1_row||_2 + ||W2_col||_2")
+        print("               (combines input and output weights)")
         print("\nExample:")
         print("  python visualize_weights.py trained_models/Noise-NCA/bubbly_0101.pt")
+        print("  python visualize_weights.py trained_models/Noise-NCA/bubbly_0101.pt -combined")
         sys.exit(1)
 
     pt_file = sys.argv[1]
+    combined = '-combined' in sys.argv
+
+    if combined:
+        print("Mode: COMBINED (input + output weights)")
+    else:
+        print("Mode: OUTPUT ONLY (W2 columns)")
 
     print(f"Loading weights from: {pt_file}")
     state_dict = load_weights(pt_file)
@@ -185,7 +229,7 @@ def main():
     w1, b1, w2 = extract_weight_components(state_dict)
 
     print("Plotting distributions...")
-    plot_weight_distributions(w1, b1, w2, pt_file)
+    plot_weight_distributions(w1, b1, w2, pt_file, combined=combined)
 
 
 if __name__ == '__main__':

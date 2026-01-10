@@ -4,6 +4,7 @@ Generate synthetic texture images for NCA training.
 
 import numpy as np
 from PIL import Image
+from scipy.ndimage import gaussian_filter
 import argparse
 import os
 
@@ -145,24 +146,229 @@ def generate_french_flag(size=256, num_stripes=None, smooth=False):
 def generate_japanese_flag(size=256, num_stripes=None, smooth=False):
     """Generate a Japanese flag pattern: white background with red circle in center."""
     img = np.ones((size, size, 3), dtype=np.uint8) * 255  # White background
-    
+
     # Japanese flag colors (RGB)
     red = np.array([188, 0, 45], dtype=np.uint8)  # Standard Japanese red
-    
+
     center = size / 2
     # Red circle diameter is typically 3/5 of the flag height
     radius = (size * 3) / 10
-    
+
     for y in range(size):
         for x in range(size):
             # Calculate distance from center
             dx = x - center + 0.5
             dy = y - center + 0.5
             dist = np.sqrt(dx**2 + dy**2)
-            
+
             if dist <= radius:
                 img[y, x, :] = red
-    
+
+    return img
+
+
+def generate_mono_polka(size=256, n_dots=5, num_stripes=None, smooth=False, border=False):
+    """Generate a square grid of orange polka dots on white background.
+
+    Args:
+        size: Image size (width and height, always square)
+        n_dots: Number of polka dots per side of the grid (e.g., 5 means 5x5 grid)
+        num_stripes: Not used, kept for API consistency
+        smooth: Not used, kept for API consistency
+        border: If True, add a thin darker border around each dot
+
+    The polka dots are arranged in a grid with spacing equal to their diameter,
+    and positioned so they don't get cut off at boundaries.
+    """
+    # White background - ensure square
+    img = np.ones((size, size, 3), dtype=np.uint8) * 255
+
+    # Orange color (RGB)
+    orange = np.array([255, 165, 0], dtype=np.uint8)
+    dark_orange = np.array([180, 100, 0], dtype=np.uint8)  # Darker orange for border
+
+    # Calculate radius from number of dots
+    radius = size / (2.0 * (2 * n_dots - 1))
+
+    # Calculate grid parameters
+    diameter = 2 * radius
+    spacing = diameter  # Distance between centers equals diameter
+
+    # Calculate total span and centering offset
+    total_span = n_dots * diameter + (n_dots - 1) * spacing
+    offset = (size - total_span) / 2
+
+    # Border thickness as fraction of radius
+    border_thickness = 0.08 * radius if border else 0.0
+
+    # Draw polka dots
+    for i in range(n_dots):
+        for j in range(n_dots):
+            # Center of this dot
+            cx = offset + i * (diameter + spacing) + radius
+            cy = offset + j * (diameter + spacing) + radius
+
+            # Draw the dot
+            for y in range(size):
+                for x in range(size):
+                    dx = x - cx + 0.5
+                    dy = y - cy + 0.5
+                    dist = np.sqrt(dx**2 + dy**2)
+
+                    if border and dist <= radius and dist > radius - border_thickness:
+                        # Draw border
+                        img[y, x, :] = dark_orange
+                    elif dist <= radius - border_thickness:
+                        # Draw main dot
+                        img[y, x, :] = orange
+                    elif not border and dist <= radius:
+                        # No border, just draw dot
+                        img[y, x, :] = orange
+
+    return img
+
+
+def generate_random_polka(size=256, n_dots=5, num_stripes=None, smooth=False, border=False):
+    """Generate a square grid of randomly colored polka dots on white background.
+
+    Args:
+        size: Image size (width and height, always square)
+        n_dots: Number of polka dots per side of the grid (e.g., 5 means 5x5 grid)
+        num_stripes: Not used, kept for API consistency
+        smooth: Not used, kept for API consistency
+        border: If True, add a thin darker border around each dot
+
+    Each dot is randomly assigned either orange or sky blue color.
+    The polka dots are arranged in a grid with spacing equal to their diameter,
+    and positioned so they don't get cut off at boundaries.
+    """
+    # White background - ensure square
+    img = np.ones((size, size, 3), dtype=np.uint8) * 255
+
+    # Orange and sky blue colors (RGB)
+    orange = np.array([255, 165, 0], dtype=np.uint8)
+    sky_blue = np.array([135, 206, 235], dtype=np.uint8)
+    dark_orange = np.array([180, 100, 0], dtype=np.uint8)
+    dark_blue = np.array([70, 130, 180], dtype=np.uint8)
+
+    # Calculate radius from number of dots
+    radius = size / (2.0 * (2 * n_dots - 1))
+
+    # Calculate grid parameters
+    diameter = 2 * radius
+    spacing = diameter  # Distance between centers equals diameter
+
+    # Calculate total span and centering offset
+    total_span = n_dots * diameter + (n_dots - 1) * spacing
+    offset = (size - total_span) / 2
+
+    # Border thickness as fraction of radius
+    border_thickness = 0.08 * radius if border else 0.0
+
+    # Draw polka dots
+    for i in range(n_dots):
+        for j in range(n_dots):
+            # Center of this dot
+            cx = offset + i * (diameter + spacing) + radius
+            cy = offset + j * (diameter + spacing) + radius
+
+            # Randomly choose orange or sky blue
+            if np.random.rand() < 0.5:
+                color = orange
+                border_color = dark_orange
+            else:
+                color = sky_blue
+                border_color = dark_blue
+
+            # Draw the dot
+            for y in range(size):
+                for x in range(size):
+                    dx = x - cx + 0.5
+                    dy = y - cy + 0.5
+                    dist = np.sqrt(dx**2 + dy**2)
+
+                    if border and dist <= radius and dist > radius - border_thickness:
+                        # Draw border
+                        img[y, x, :] = border_color
+                    elif dist <= radius - border_thickness:
+                        # Draw main dot
+                        img[y, x, :] = color
+                    elif not border and dist <= radius:
+                        # No border, just draw dot
+                        img[y, x, :] = color
+
+    return img
+
+
+def generate_checkered_polka(size=256, n_dots=5, num_stripes=None, smooth=False, border=False):
+    """Generate a checkered square grid of orange and sky blue polka dots on white background.
+
+    Args:
+        size: Image size (width and height, always square)
+        n_dots: Number of polka dots per side of the grid (e.g., 5 means 5x5 grid)
+        num_stripes: Not used, kept for API consistency
+        smooth: Not used, kept for API consistency
+        border: If True, add a thin darker border around each dot
+
+    Dots at position (i,j) are orange if i+j is even, sky blue if i+j is odd.
+    The polka dots are arranged in a grid with spacing equal to their diameter,
+    and positioned so they don't get cut off at boundaries.
+    """
+    # White background - ensure square
+    img = np.ones((size, size, 3), dtype=np.uint8) * 255
+
+    # Orange and sky blue colors (RGB)
+    orange = np.array([255, 165, 0], dtype=np.uint8)
+    sky_blue = np.array([135, 206, 235], dtype=np.uint8)
+    dark_orange = np.array([180, 100, 0], dtype=np.uint8)
+    dark_blue = np.array([70, 130, 180], dtype=np.uint8)  # Darker sky blue
+
+    # Calculate radius from number of dots
+    radius = size / (2.0 * (2 * n_dots - 1))
+
+    # Calculate grid parameters
+    diameter = 2 * radius
+    spacing = diameter  # Distance between centers equals diameter
+
+    # Calculate total span and centering offset
+    total_span = n_dots * diameter + (n_dots - 1) * spacing
+    offset = (size - total_span) / 2
+
+    # Border thickness as fraction of radius
+    border_thickness = 0.08 * radius if border else 0.0
+
+    # Draw polka dots
+    for i in range(n_dots):
+        for j in range(n_dots):
+            # Center of this dot
+            cx = offset + i * (diameter + spacing) + radius
+            cy = offset + j * (diameter + spacing) + radius
+
+            # Choose color based on checkered pattern
+            if (i + j) % 2 == 0:
+                color = orange
+                border_color = dark_orange
+            else:
+                color = sky_blue
+                border_color = dark_blue
+
+            # Draw the dot
+            for y in range(size):
+                for x in range(size):
+                    dx = x - cx + 0.5
+                    dy = y - cy + 0.5
+                    dist = np.sqrt(dx**2 + dy**2)
+
+                    if border and dist <= radius and dist > radius - border_thickness:
+                        # Draw border
+                        img[y, x, :] = border_color
+                    elif dist <= radius - border_thickness:
+                        # Draw main dot
+                        img[y, x, :] = color
+                    elif not border and dist <= radius:
+                        # No border, just draw dot
+                        img[y, x, :] = color
+
     return img
 
 
@@ -178,7 +384,7 @@ def save_texture(img, filename, quality=95):
 def main():
     parser = argparse.ArgumentParser(description='Generate synthetic texture images')
     parser.add_argument('--pattern', type=str, default='vertical_stripes',
-                        choices=['vertical_stripes', 'horizontal_stripes', 'diagonal_stripes', 'bullseye', 'burst', 'french_flag', 'japanese_flag'],
+                        choices=['vertical_stripes', 'horizontal_stripes', 'diagonal_stripes', 'bullseye', 'burst', 'french_flag', 'japanese_flag', 'mono_polka', 'checkered_polka', 'random_polka'],
                         help='Pattern type to generate')
     parser.add_argument('--output', type=str, default='generated_texture.jpg',
                         help='Output filename')
@@ -186,9 +392,15 @@ def main():
                         help='Image size (square)')
     parser.add_argument('--num_stripes', type=int, default=10,
                         help='Number of stripes (for stripe patterns)')
+    parser.add_argument('--n', type=int, default=5,
+                        help='Number of polka dots per side of grid (for mono_polka pattern). Default: 5 (creates 5x5 grid)')
+    parser.add_argument('--smoothing_rad', type=float, default=0.0,
+                        help='Gaussian smoothing radius. If non-zero, apply Gaussian blur with this sigma value.')
     parser.add_argument('--smooth', action='store_true',
                         help='Use sinusoidal variation instead of sharp stripes')
-    
+    parser.add_argument('--border', action='store_true',
+                        help='Add a thin darker border around each polka dot (for polka patterns only)')
+
     args = parser.parse_args()
     
     if args.pattern == 'vertical_stripes':
@@ -208,7 +420,51 @@ def main():
         # Use PNG for Japanese flag to avoid JPEG artifacts on circle edges
         if not args.output.lower().endswith('.png'):
             args.output = args.output.rsplit('.', 1)[0] + '.png'
-    
+    elif args.pattern == 'mono_polka':
+        img = generate_mono_polka(size=args.size, n_dots=args.n, smooth=args.smooth, border=args.border)
+        # Use PNG for polka dots to avoid JPEG artifacts on circle edges
+        if not args.output.lower().endswith('.png'):
+            args.output = args.output.rsplit('.', 1)[0] + '.png'
+    elif args.pattern == 'checkered_polka':
+        img = generate_checkered_polka(size=args.size, n_dots=args.n, smooth=args.smooth, border=args.border)
+        # Use PNG for polka dots to avoid JPEG artifacts on circle edges
+        if not args.output.lower().endswith('.png'):
+            args.output = args.output.rsplit('.', 1)[0] + '.png'
+    elif args.pattern == 'random_polka':
+        img = generate_random_polka(size=args.size, n_dots=args.n, smooth=args.smooth, border=args.border)
+        # Use PNG for polka dots to avoid JPEG artifacts on circle edges
+        if not args.output.lower().endswith('.png'):
+            args.output = args.output.rsplit('.', 1)[0] + '.png'
+
+    # Apply Gaussian smoothing if requested
+    if args.smoothing_rad > 0:
+        # Convert RGB to HSV for better color preservation
+        from PIL import Image as PILImage
+        pil_img = PILImage.fromarray(img)
+        hsv_img = pil_img.convert('HSV')
+        hsv_array = np.array(hsv_img).astype(np.float32)
+
+        # Smooth Saturation and Value channels, but NOT Hue
+        # This prevents color distortion from averaging hue (which is circular)
+        h_channel = hsv_array[:, :, 0]  # Hue - don't smooth (circular values)
+        s_channel = hsv_array[:, :, 1]  # Saturation - smooth this
+        v_channel = hsv_array[:, :, 2]  # Value - smooth this
+
+        # Apply Gaussian filter to Saturation and Value channels
+        s_smoothed = gaussian_filter(s_channel, sigma=args.smoothing_rad, mode='reflect')
+        v_smoothed = gaussian_filter(v_channel, sigma=args.smoothing_rad, mode='reflect')
+
+        # Reconstruct HSV with smoothed S and V
+        hsv_smoothed = np.stack([h_channel, s_smoothed, v_smoothed], axis=2)
+
+        # Clip and convert back to uint8
+        hsv_smoothed = np.clip(hsv_smoothed, 0, 255).astype(np.uint8)
+
+        # Convert back to RGB
+        hsv_pil = PILImage.fromarray(hsv_smoothed, mode='HSV')
+        img = np.array(hsv_pil.convert('RGB'))
+        print(f"Applied Gaussian smoothing in HSV space (S and V channels) with sigma={args.smoothing_rad}")
+
     save_texture(img, args.output)
     print(f"Generated {args.pattern} texture: {args.output}")
 
