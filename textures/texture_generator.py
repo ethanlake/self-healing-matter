@@ -300,6 +300,195 @@ def generate_random_polka(size=256, n_dots=5, num_stripes=None, smooth=False, bo
     return img
 
 
+def generate_strips(size=256, n_strips=5, num_stripes=None, smooth=False, border=False, weaved=False):
+    """Generate a pattern with vertical blue strips and horizontal red strips on white background.
+
+    Args:
+        size: Image size (width and height, always square)
+        n_strips: Number of strips per direction (n vertical blue, n horizontal red)
+        num_stripes: Not used, kept for API consistency
+        smooth: If True, modulate intensity with cosine along strip direction
+        border: Not used, kept for API consistency
+        weaved: If True, create a checkerboard weave pattern at intersections
+
+    The vertical strips are blue and horizontal strips are red.
+    Each strip has black borders. Strip width equals spacing between strips.
+    If weaved=True, strips alternate being on top in a checkerboard pattern.
+    If smooth=True, intensity varies: minimum at strip boundaries, maximum at strip centers.
+    """
+    # White background - ensure square
+    img = np.ones((size, size, 3), dtype=np.float32) * 255
+
+    # Colors (RGB) as float for smooth modulation
+    blue = np.array([38, 147, 255], dtype=np.float32)
+    red = np.array([255, 84, 61], dtype=np.float32)
+    black = np.array([0, 0, 0], dtype=np.float32)
+
+    # Calculate strip width and spacing
+    # For n strips: n*width + (n+1)*spacing = size
+    # With width = spacing: n*w + (n+1)*w = size
+    # w*(2n + 1) = size
+    # w = size / (2n + 1)
+    strip_width = size / (2.0 * n_strips + 1)
+    spacing = strip_width
+    border_width = 0 * max(1, int(0.0 * strip_width))  # 15% of strip width, at least 1 pixel
+
+    # Smoothness factor (intensity modulation strength)
+    smoothness = 0.4 if smooth else 0.0
+
+    if not weaved:
+        # Original non-weaved version: draw horizontal first, then vertical on top
+        # Draw horizontal red strips first (so vertical will be on top)
+        for i in range(n_strips):
+            # Calculate position: skip spacing, then i*(strip_width + spacing)
+            y_start = int(spacing + i * (strip_width + spacing))
+            y_end = int(y_start + strip_width)
+
+            # Draw the red strip with intensity modulation if smooth
+            # Horizontal strips modulate in x direction (orthogonal to strip)
+            for x in range(size):
+                # Calculate position within strip [0, 1] in x direction
+                pos_in_strip = (x % (strip_width + spacing)) / strip_width
+                # Cosine modulation with π/2 phase shift: max at intersections
+                # sin(π * pos) = cos(π * pos - π/2)
+                modulation = np.sin(np.pi * pos_in_strip)
+                # Apply: color * (1 + smoothness * modulation)
+                modulated_color = red * (1 + smoothness * modulation)
+                img[y_start:y_end, x, :] = np.clip(modulated_color, 0, 255)
+
+            # Draw black borders (top and bottom)
+            img[y_start:y_start + border_width, :, :] = black
+            img[y_end - border_width:y_end, :, :] = black
+
+        # Draw vertical blue strips on top
+        for i in range(n_strips):
+            # Calculate position: skip spacing, then i*(strip_width + spacing)
+            x_start = int(spacing + i * (strip_width + spacing))
+            x_end = int(x_start + strip_width)
+
+            # Draw the blue strip with intensity modulation if smooth
+            # Vertical strips modulate in y direction (orthogonal to strip)
+            for y in range(size):
+                # Calculate position within strip [0, 1] in y direction
+                pos_in_strip = (y % (strip_width + spacing)) / strip_width
+                # Cosine modulation with π/2 phase shift: max at intersections
+                # sin(π * pos) = cos(π * pos - π/2)
+                modulation = np.sin(np.pi * pos_in_strip)
+                # Apply: color * (1 + smoothness * modulation)
+                modulated_color = blue * (1 + smoothness * modulation)
+                img[y, x_start:x_end, :] = np.clip(modulated_color, 0, 255)
+
+            # Draw black borders (left and right)
+            img[:, x_start:x_start + border_width, :] = black
+            img[:, x_end - border_width:x_end, :] = black
+
+    else:
+        # Weaved version: checkerboard pattern at intersections
+        # Draw all horizontal red strips
+        for i in range(n_strips):
+            y_start = int(spacing + i * (strip_width + spacing))
+            y_end = int(y_start + strip_width)
+
+            # Draw the red strip with intensity modulation if smooth
+            # Horizontal strips modulate in x direction (orthogonal to strip)
+            for x in range(size):
+                pos_in_strip = (x % (strip_width + spacing)) / strip_width
+                modulation = np.sin(np.pi * pos_in_strip)
+                modulated_color = red * (1 + smoothness * modulation)
+                img[y_start:y_end, x, :] = np.clip(modulated_color, 0, 255)
+
+            # Draw horizontal borders segment-by-segment, respecting weaving
+            for x in range(size):
+                # Check if this x position is in a vertical strip
+                in_vertical_strip = False
+                vertical_strip_idx = -1
+                for j in range(n_strips):
+                    x_start_v = int(spacing + j * (strip_width + spacing))
+                    x_end_v = int(x_start_v + strip_width)
+                    if x_start_v <= x < x_end_v:
+                        in_vertical_strip = True
+                        vertical_strip_idx = j
+                        break
+
+                # Draw border only if:
+                # 1. Not in vertical strip (white space), OR
+                # 2. In vertical strip but horizontal is on top: (i + j) % 2 == 1
+                should_draw_border = (not in_vertical_strip) or ((i + vertical_strip_idx) % 2 == 1)
+
+                if should_draw_border:
+                    # Draw top border
+                    img[y_start:y_start + border_width, x, :] = black
+                    # Draw bottom border
+                    img[y_end - border_width:y_end, x, :] = black
+
+        # Draw all vertical blue strips with weaving
+        for j in range(n_strips):
+            x_start = int(spacing + j * (strip_width + spacing))
+            x_end = int(x_start + strip_width)
+
+            # For each horizontal strip, determine if blue should be on top or bottom
+            for i in range(n_strips):
+                y_start = int(spacing + i * (strip_width + spacing))
+                y_end = int(y_start + strip_width)
+
+                # Checkerboard pattern: (i + j) % 2 determines which is on top
+                if (i + j) % 2 == 0:
+                    # Blue on top at this intersection with modulation
+                    # Vertical strips modulate in y direction (orthogonal to strip)
+                    for y in range(y_start, y_end):
+                        pos_in_strip = (y % (strip_width + spacing)) / strip_width
+                        modulation = np.sin(np.pi * pos_in_strip)
+                        modulated_color = blue * (1 + smoothness * modulation)
+                        img[y, x_start:x_end, :] = np.clip(modulated_color, 0, 255)
+                # else: Red stays on top (already drawn)
+
+            # Now draw the full vertical strip where there are no intersections (white spaces)
+            for y in range(size):
+                # Check if this y position is NOT in any horizontal strip
+                in_horizontal_strip = False
+                for i in range(n_strips):
+                    y_start_h = int(spacing + i * (strip_width + spacing))
+                    y_end_h = int(y_start_h + strip_width)
+                    if y_start_h <= y < y_end_h:
+                        in_horizontal_strip = True
+                        break
+
+                if not in_horizontal_strip:
+                    # Draw blue in white space areas with modulation
+                    # Vertical strips modulate in y direction (orthogonal to strip)
+                    pos_in_strip = (y % (strip_width + spacing)) / strip_width
+                    modulation = np.sin(np.pi * pos_in_strip)
+                    modulated_color = blue * (1 + smoothness * modulation)
+                    img[y, x_start:x_end, :] = np.clip(modulated_color, 0, 255)
+
+            # Draw vertical borders segment-by-segment, respecting weaving
+            for y in range(size):
+                # Check if this y position is in a horizontal strip
+                in_horizontal_strip = False
+                horizontal_strip_idx = -1
+                for i in range(n_strips):
+                    y_start_h = int(spacing + i * (strip_width + spacing))
+                    y_end_h = int(y_start_h + strip_width)
+                    if y_start_h <= y < y_end_h:
+                        in_horizontal_strip = True
+                        horizontal_strip_idx = i
+                        break
+
+                # Draw border only if:
+                # 1. Not in horizontal strip (white space), OR
+                # 2. In horizontal strip but vertical is on top: (i + j) % 2 == 0
+                should_draw_border = (not in_horizontal_strip) or ((horizontal_strip_idx + j) % 2 == 0)
+
+                if should_draw_border:
+                    # Draw left border
+                    img[y, x_start:x_start + border_width, :] = black
+                    # Draw right border
+                    img[y, x_end - border_width:x_end, :] = black
+
+    # Convert back to uint8
+    return img.astype(np.uint8)
+
+
 def generate_checkered_polka(size=256, n_dots=5, num_stripes=None, smooth=False, border=False):
     """Generate a checkered square grid of orange and sky blue polka dots on white background.
 
@@ -384,7 +573,7 @@ def save_texture(img, filename, quality=95):
 def main():
     parser = argparse.ArgumentParser(description='Generate synthetic texture images')
     parser.add_argument('--pattern', type=str, default='vertical_stripes',
-                        choices=['vertical_stripes', 'horizontal_stripes', 'diagonal_stripes', 'bullseye', 'burst', 'french_flag', 'japanese_flag', 'mono_polka', 'checkered_polka', 'random_polka'],
+                        choices=['vertical_stripes', 'horizontal_stripes', 'diagonal_stripes', 'bullseye', 'burst', 'french_flag', 'japanese_flag', 'mono_polka', 'checkered_polka', 'random_polka', 'strips'],
                         help='Pattern type to generate')
     parser.add_argument('--output', type=str, default='generated_texture.jpg',
                         help='Output filename')
@@ -400,6 +589,8 @@ def main():
                         help='Use sinusoidal variation instead of sharp stripes')
     parser.add_argument('--border', action='store_true',
                         help='Add a thin darker border around each polka dot (for polka patterns only)')
+    parser.add_argument('--weaved', action='store_true',
+                        help='Create a checkerboard weave pattern (for strips pattern only)')
 
     args = parser.parse_args()
     
@@ -435,6 +626,8 @@ def main():
         # Use PNG for polka dots to avoid JPEG artifacts on circle edges
         if not args.output.lower().endswith('.png'):
             args.output = args.output.rsplit('.', 1)[0] + '.png'
+    elif args.pattern == 'strips':
+        img = generate_strips(size=args.size, n_strips=args.n, smooth=args.smooth, border=args.border, weaved=args.weaved)
 
     # Apply Gaussian smoothing if requested
     if args.smoothing_rad > 0:
