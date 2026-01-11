@@ -275,9 +275,12 @@ const PROGRAMS = {
     perception: `
     const highp mat3 sobelX = mat3(-1.0, 0.0, 1.0, -2.0, 0.0, 2.0, -1.0, 0.0, 1.0);
     const highp mat3 sobelY = mat3(-1.0,-2.0,-1.0, 0.0, 0.0, 0.0, 1.0, 2.0, 1.0);
-    
+
     const highp mat3 lapX = mat3(0.5, 0.0, 0.5, 2.0, -6.0, 2.0, 0.5, 0.0, 0.5);
     const highp mat3 lapY = mat3(0.5, 2.0, 0.5, 0.0, -6.0, 0.0, 0.5, 2.0, 0.5);
+
+    // Isotropic Laplacian for RD models (unnormalized, same as Python)
+    const highp mat3 laplacian = mat3(1.0, 2.0, 1.0, 2.0, -12.0, 2.0, 1.0, 2.0, 1.0);
 
     vec4 conv3x3(vec2 xy, float inputCh, mat3 filter) {
         highp vec4 a = vec4(0.0);
@@ -291,7 +294,8 @@ const PROGRAMS = {
 
     uniform float u_seed, u_updateProbability;
     uniform float u_dx, u_dy;
-    
+    uniform float u_isRD;  // 1.0 for RD models, 0.0 for NCA models
+
     void main() {
         vec2 xy = getOutputXY();
 
@@ -304,27 +308,39 @@ const PROGRAMS = {
         float ch = getOutputChannel();
         if (ch >= u_output.depth4)
             return;
-            
-        
+
+
 
         float filterBand = floor((ch+0.5)/u_input.depth4);
         // inputCh: this is the channel idx in the original tensor
         float inputCh = ch-filterBand*u_input.depth4;
 
-        // Standard model: identity, sobel_x, sobel_y, laplacian
-        if (filterBand < 0.5) {
-            setOutput(u_input_read(xy, inputCh));
-        } else if (filterBand < 2.5) {
-            highp vec4 dx = conv3x3(xy, inputCh, sobelX) / u_dx;
-            highp vec4 dy = conv3x3(xy, inputCh, sobelY) / u_dy;
-            highp vec2 dir = getCellDirection(xy);
-            float s = dir.x, c = dir.y;
-            highp vec4 res = filterBand < 1.5 ? dx*c-dy*s: dx*s+dy*c;
-            setOutput(res);
+        // RD model: identity and laplacian only (2 filters)
+        if (u_isRD > 0.5) {
+            if (filterBand < 0.5) {
+                // Identity filter
+                setOutput(u_input_read(xy, inputCh));
+            } else {
+                // Laplacian filter (unnormalized for rotation invariance)
+                highp vec4 res = conv3x3(xy, inputCh, laplacian);
+                setOutput(res);
+            }
         } else {
-            mat3 lap = lapX / (u_dx * u_dx) + lapY / (u_dy * u_dy);
-            highp vec4 res = conv3x3(xy, inputCh, lap);
-            setOutput(res);
+            // Standard NCA model: identity, sobel_x, sobel_y, laplacian (4 filters)
+            if (filterBand < 0.5) {
+                setOutput(u_input_read(xy, inputCh));
+            } else if (filterBand < 2.5) {
+                highp vec4 dx = conv3x3(xy, inputCh, sobelX) / u_dx;
+                highp vec4 dy = conv3x3(xy, inputCh, sobelY) / u_dy;
+                highp vec2 dir = getCellDirection(xy);
+                float s = dir.x, c = dir.y;
+                highp vec4 res = filterBand < 1.5 ? dx*c-dy*s: dx*s+dy*c;
+                setOutput(res);
+            } else {
+                mat3 lap = lapX / (u_dx * u_dx) + lapY / (u_dy * u_dy);
+                highp vec4 res = conv3x3(xy, inputCh, lap);
+                setOutput(res);
+            }
         }
     }`,
     dense: `
@@ -336,6 +352,7 @@ const PROGRAMS = {
     uniform highp vec2 u_layout;
     uniform highp vec2 grid_size;
     uniform bool bias, pos_emb, relu;
+    uniform float u_isRD;  // 1.0 for RD models, 0.0 for NCA models
     
     const float MAX_PACKED_DEPTH = 32.0;
     
@@ -419,11 +436,11 @@ const PROGRAMS = {
         result += readWeightUnscaled(p);  // bias
         // p.y += dy; 
       };
-      
+
       result = result*u_weightCoefs.x;
       if (relu) {
+        // ReLU activation (same for both NCA and RD models)
         result = max(result, 0.0);
-      
       }
       setOutput(result);
     }`,
@@ -772,6 +789,37 @@ function createDropoutMaskTexture(gl, channelCount, mask) {
     });
 }
 
+function detectModelType(models, channel_n = 12) {
+    // Detect if model is RD or NCA based on layer 0 input dimensions
+    if (!models.layers || models.layers.length < 1) {
+        console.warn('No layers found in model, defaulting to NCA');
+        return 'nca';
+    }
+
+    // Check if model_type is explicitly specified in JSON
+    if (models.model_type) {
+        console.log(`Model type explicitly set to: ${models.model_type}`);
+        return models.model_type;
+    }
+
+    const layer0 = models.layers[0];
+    const layer0_shape = layer0.shape;  // [input_dim, output_dim]
+
+    // Subtract 1 from input_dim if bias is present (bias row at end)
+    const input_dim = layer0.bias ? layer0_shape[0] - 1 : layer0_shape[0];
+
+    if (input_dim === 2 * channel_n) {
+        console.log(`Detected RD model: input_dim=${input_dim} = 2 × ${channel_n} (identity + laplacian)`);
+        return 'rd';
+    } else if (input_dim === 4 * channel_n) {
+        console.log(`Detected NCA model: input_dim=${input_dim} = 4 × ${channel_n} (identity + sobel_x + sobel_y + laplacian)`);
+        return 'nca';
+    } else {
+        console.warn(`Unknown model type with input_dim=${input_dim}, channel_n=${channel_n}, defaulting to NCA`);
+        return 'nca';
+    }
+}
+
 export class NoiseNCA {
     constructor(gl, models, gridSize, gui) {
         // models is basically the json file
@@ -779,7 +827,11 @@ export class NoiseNCA {
         self = this;
         this.gl = gl;
 
-
+        // Detect model type (RD or NCA) before setting up anything else
+        const lastLayer = models.layers[models.layers.length - 1];
+        const channel_n = lastLayer.out_n || lastLayer.shape[1];
+        this.modelType = detectModelType(models, channel_n);
+        this.isRD = (this.modelType === 'rd');
 
         // alert(this.n_perception_scales)
 
@@ -966,6 +1018,7 @@ export class NoiseNCA {
                 u_input: this.buf.state, u_angle: this.rotationAngle / 180.0 * Math.PI,
                 u_alignment: this.alignment, u_hexGrid: this.hexGrid, u_dx: this.dx, u_dy: this.dy,
                 u_seed: seed, u_updateProbability: this.updateProbability,
+                u_isRD: this.isRD ? 1.0 : 0.0,
             });
         }
 
@@ -1756,7 +1809,7 @@ export class NoiseNCA {
             u_seed: seed, u_fuzz: this.fuzz, u_updateProbability: this.updateProbability,
             bias: layer.bias, pos_emb: layer.pos_emb, relu: relu,
             grid_size: this.gridSize, u_angle: this.rotationAngle / 180.0 * Math.PI,
-
+            u_isRD: this.isRD ? 1.0 : 0.0,
         });
     }
 
