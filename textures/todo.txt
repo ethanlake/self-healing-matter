@@ -3,3 +3,5 @@ to demonstrate:
 noise - induced ordering: 
 1. A -> B -> trivial 
 2. A -> B -> A -> trivial 
+
+with injecting seeds every 16 iterations, does much better than with every 8. 
