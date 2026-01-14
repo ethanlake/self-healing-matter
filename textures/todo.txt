@@ -5,3 +5,5 @@ noise - induced ordering:
 2. A -> B -> A -> trivial 
 
 with injecting seeds every 16 iterations, does much better than with every 8. 
+
+leopard model: take out hidden layers 5, 6, 9, and it does synchronized flashing! 

@@ -5,6 +5,11 @@ Add a trained model and its target image to the demo.
 Usage:
     python3 add_model.py --weights weight_file.pt --image image.png --model_name my_model
     python3 add_model.py --weights weight_file.pt --image image.jpg --model_name my_model --model_type Noise-NCA
+    python3 add_model.py --weights weight_file.pt --image image.png --model_name my_model --category objects
+
+Categories:
+    textures (default): Models trained on texture images with uniform noise initialization
+    objects: Models trained on object images with center seed initialization (Growing NCA style)
 """
 
 import argparse
@@ -14,6 +19,12 @@ import subprocess
 import sys
 import json
 from PIL import Image
+
+# Valid categories and their metadata keys
+VALID_CATEGORIES = {
+    'textures': 'texture_names',
+    'objects': 'object_names',
+}
 
 
 def confirm_overwrite(filepath):
@@ -40,7 +51,10 @@ def main():
     parser.add_argument('--model_name', type=str, required=True,
                         help='Name for the model (used for filenames)')
     parser.add_argument('--model_type', type=str, default='Noise-NCA',
-                        help='Model type (default: Noise-NCA)')
+                        help='Model type for folder organization (default: Noise-NCA)')
+    parser.add_argument('--category', type=str, default='textures',
+                        choices=list(VALID_CATEGORIES.keys()),
+                        help='Model category: textures (uniform noise init) or objects (center seed init)')
 
     args = parser.parse_args()
 
@@ -59,14 +73,21 @@ def main():
         print(f"Error: Image must be .png or .jpg, got '{image_ext}'")
         sys.exit(1)
 
-    # Define target paths
+    # Define target paths based on category
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    image_dir = os.path.join(script_dir, 'data', 'images', 'texture')
+    # Image folder depends on category
+    image_subdir = 'texture' if args.category == 'textures' else 'object'
+    image_dir = os.path.join(script_dir, 'data', 'images', image_subdir)
     # Always save as .jpg for consistency with demo
     image_target = os.path.join(image_dir, f"{args.model_name}.jpg")
 
-    weights_dir = os.path.join(script_dir, 'trained_models', args.model_type, args.model_name)
+    # Weights folder: trained_models/<category>/<model_type>/<model_name>/
+    # e.g., trained_models/Objects/Noise-NCA/my_model/ or trained_models/Noise-NCA/my_model/
+    if args.category == 'objects':
+        weights_dir = os.path.join(script_dir, 'trained_models', 'Objects', args.model_type, args.model_name)
+    else:
+        weights_dir = os.path.join(script_dir, 'trained_models', args.model_type, args.model_name)
     weights_target = os.path.join(weights_dir, 'weights.pt')
 
     models_dir = os.path.join(script_dir, 'data', 'models')
@@ -126,8 +147,17 @@ def main():
     # Convert weights to JSON
     print(f"Converting weights to JSON...")
     try:
+        # Build command with optional flags
+        convert_cmd = ['python3', convert_script, weights_target, json_target]
+
+        # Object models (from nca_experiments.ipynb) use Growing NCA mode
+        # with normalized Sobel filters and stochastic fire_rate=0.5
+        if args.category == 'objects':
+            convert_cmd.append('--growing-mode')
+            print("  Adding --growing-mode flag for object model")
+
         result = subprocess.run(
-            ['python3', convert_script, weights_target, json_target],
+            convert_cmd,
             check=True,
             capture_output=True,
             text=True
@@ -151,30 +181,36 @@ def main():
         with open(metadata_file, 'r') as f:
             metadata = json.load(f)
 
-        # Check if model name already exists in texture_names
-        if args.model_name in metadata.get('texture_names', []):
-            print(f"  Model '{args.model_name}' already in metadata, skipping")
+        # Get the appropriate metadata key based on category
+        metadata_key = VALID_CATEGORIES[args.category]
+
+        # Check if model name already exists
+        if args.model_name in metadata.get(metadata_key, []):
+            print(f"  Model '{args.model_name}' already in {metadata_key}, skipping")
         else:
-            # Add model name to texture_names
-            if 'texture_names' not in metadata:
-                metadata['texture_names'] = []
-            metadata['texture_names'].append(args.model_name)
+            # Add model name to the appropriate list
+            if metadata_key not in metadata:
+                metadata[metadata_key] = []
+            metadata[metadata_key].append(args.model_name)
 
             # Write back to file
             with open(metadata_file, 'w') as f:
                 json.dump(metadata, f, indent=2)
 
-            print(f"✓ Added '{args.model_name}' to metadata.json")
+            print(f"✓ Added '{args.model_name}' to {metadata_key} in metadata.json")
 
     except Exception as e:
         print(f"Error updating metadata.json: {e}")
         print("You may need to manually add the model name to metadata.json")
 
     print(f"\n✓ Successfully added model '{args.model_name}'")
+    print(f"  - Category: {args.category}")
     print(f"  - Image: {image_target}")
     print(f"  - Weights: {weights_target}")
     print(f"  - JSON: {json_target}")
     print(f"  - Added to: {metadata_file}")
+    if args.category == 'objects':
+        print(f"\n  Note: Object models use center seed initialization. Select 'Center Seed' in the demo.")
 
 
 if __name__ == '__main__':

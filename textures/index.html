@@ -324,6 +324,17 @@
                     </div>
 
                     <div style="text-align: center; padding: 8px; grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 15px;">
+                        <label style="cursor: pointer;" title="Enable for Reaction-Diffusion models trained with rd_training.ipynb">
+                            <input type="checkbox" id="rdMode"> RD Mode
+                        </label>
+                        <label style="display: flex; align-items: center; gap: 4px;" title="Initial condition type when resetting">
+                            Init:
+                            <select id="initType" style="padding: 2px 4px;">
+                                <option value="uniform">Uniform Noise</option>
+                                <option value="gaussian_blobs">Gaussian Blobs</option>
+                                <option value="center_seed">Center Seed</option>
+                            </select>
+                        </label>
                         <label style="cursor: pointer;">
                             <input type="checkbox" id="altTexture"> Alt. Texture
                         </label>

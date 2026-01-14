@@ -142,30 +142,46 @@ export function createDemo(divId) {
         }
 
 
-        let texture_names = metadata['texture_names'];
+        let texture_names = metadata['texture_names'] || [];
+        let object_names = metadata['object_names'] || [];
 
         // let texture_images = metadata['texture_images'];
 
-        // Helper function to get texture image path (tries .jpg first, then .jpeg)
-        function getTextureImagePath(texture_name) {
+        // Helper function to get image path based on category
+        function getImagePath(name, category = 'texture') {
             // For blue_spiral, use .jpeg, otherwise try .jpg
-            if (texture_name === "blue_spiral") {
-                return "data/images/texture/" + texture_name + ".jpeg";
+            if (name === "blue_spiral") {
+                return "data/images/texture/" + name + ".jpeg";
             }
-            return "data/images/texture/" + texture_name + ".jpg";
+            const subdir = category === 'object' ? 'object' : 'texture';
+            return "data/images/" + subdir + "/" + name + ".jpg";
         }
 
-        async function setTextureModel(idx) {
-            params.texture_name = texture_names[idx];
-            params.texture_img = getTextureImagePath(texture_names[idx]);
+        // Legacy helper for backwards compatibility
+        function getTextureImagePath(texture_name) {
+            return getImagePath(texture_name, 'texture');
+        }
 
-            params.modelSet = "data/models/" + texture_names[idx] + ".json"
+        // Build a combined model list with category info
+        // Each entry: { name, category: 'texture' | 'object' }
+        const allModels = [];
+        texture_names.forEach(name => allModels.push({ name, category: 'texture' }));
+        object_names.forEach(name => allModels.push({ name, category: 'object' }));
+
+        async function setTextureModel(idx) {
+            const model = allModels[idx];
+            params.texture_name = model.name;
+            params.texture_img = getImagePath(model.name, model.category);
+            params.texture_category = model.category;
+
+            params.modelSet = "data/models/" + model.name + ".json"
             params.texture_idx = idx;
 
             $("#origtex").style.background = "url('" + params.texture_img + "')";
             $("#origtex").style.backgroundSize = "100%100%";
             let dtd = document.createElement('p')
-            dtd.innerHTML = "Texture Name: " + params.texture_name
+            const categoryLabel = model.category === 'object' ? 'Object' : 'Texture';
+            dtd.innerHTML = categoryLabel + " Name: " + params.texture_name
             // dtd.href = "https://www.robots.ox.ac.uk/~vgg/data/dtd/"
             $("#texhinttext").innerHTML = '';
             $("#texhinttext").appendChild(dtd);
@@ -182,17 +198,18 @@ export function createDemo(divId) {
                 video.load()
                 video.play();
             }
-
         }
 
         async function setAltTextureModel(idx) {
-            params.altTextureName = texture_names[idx];
+            const model = allModels[idx];
+            params.altTextureName = model.name;
             params.altTextureIdx = idx;
             await loadAltModel(idx);
         }
 
         async function loadAltModel(idx) {
-            const altModelSet = "data/models/" + texture_names[idx] + ".json";
+            const model = allModels[idx];
+            const altModelSet = "data/models/" + model.name + ".json";
             const r = await fetch(altModelSet);
             altModels = await r.json();
             if (ca) {
@@ -202,36 +219,46 @@ export function createDemo(divId) {
         // Make loadAltModel accessible from updateCA
         loadAltModelFn = loadAltModel;
 
-        let len = texture_names.length;
-        console.log('Loading', len, 'textures from metadata');
-        for (let idx = 0; idx < len; idx++) {
-            let media_path = "";
-            let texture_name = "";
+        let len = allModels.length;
+        console.log('Loading', len, 'models from metadata (' + texture_names.length + ' textures, ' + object_names.length + ' objects)');
 
-            texture_name = texture_names[idx];
-            media_path = getTextureImagePath(texture_name);
-            
-            if (texture_name === 'blue_spiral') {
+        // Track where objects start for visual separator
+        const objectStartIdx = texture_names.length;
+
+        for (let idx = 0; idx < len; idx++) {
+            const model = allModels[idx];
+            let media_path = getImagePath(model.name, model.category);
+
+            if (model.name === 'blue_spiral') {
                 console.log('Processing blue_spiral at index', idx, 'with path:', media_path);
             }
 
+            // Add a separator before the first object model
+            if (idx === objectStartIdx && object_names.length > 0) {
+                const separator = document.createElement('div');
+                separator.className = 'texture-separator';
+                separator.innerHTML = '<span>Objects</span>';
+                separator.style.cssText = 'grid-column: 1 / -1; text-align: center; padding: 8px; color: #888; font-size: 12px; border-top: 1px solid #444; margin-top: 8px;';
+                $('#texture').insertBefore(separator, $('#texture').lastElementChild);
+            }
 
             const texture = document.createElement('div');
             texture.style.background = "url('" + media_path + "')";
             texture.style.backgroundSize = "100%100%";
             // texture.style.backgroundSize = "100px100px";
-            texture.id = texture_name; //html5 support arbitrary id:s
+            texture.id = model.name; //html5 support arbitrary id:s
             texture.className = 'texture-square';
+            texture.dataset.category = model.category;  // Store category for init type auto-selection
             // Add error handling for image loading
             const img = new Image();
             img.onerror = () => {
-                console.warn('Failed to load texture image:', media_path);
+                console.warn('Failed to load model image:', media_path);
             };
             img.src = media_path;
             texture.onclick = () => {
                 // removeOverlayIcon();
-                console.log('Texture clicked, selectingAltTexture:', selectingAltTexture, 'idx:', idx);
-                console.log('  texture_name:', texture_name);
+                console.log('Model clicked, selectingAltTexture:', selectingAltTexture, 'idx:', idx);
+                console.log('  model_name:', model.name, 'category:', model.category);
                 if (selectingAltTexture) {
                     // Selecting alternate texture (green border)
                     console.log('Selecting alt texture');
@@ -242,7 +269,7 @@ export function createDemo(divId) {
                     texture.style.borderColor = "rgb(76 175 80)";  // Green
                     setAltTextureModel(idx);
                 } else {
-                    // Selecting primary texture (orange border)
+                    // Selecting primary model (orange border)
                     if (currentTexture) {
                         currentTexture.style.borderColor = currentTexture === altCurrentTexture ? "rgb(76 175 80)" : "white";
                     }
@@ -252,12 +279,22 @@ export function createDemo(divId) {
                         texture.scrollIntoView({behavior: "smooth", block: "nearest", inline: "center"})
                     }
                     setTextureModel(idx);
+
+                    // Auto-select appropriate init type based on category
+                    const initTypeSelect = $('#initType');
+                    if (initTypeSelect) {
+                        if (model.category === 'object') {
+                            initTypeSelect.value = 'center_seed';
+                        } else {
+                            initTypeSelect.value = 'uniform';
+                        }
+                    }
                 }
             };
             let gridBox = $('#texture');
 
 
-            if (texture_name == initTexture) {
+            if (model.name == initTexture) {
                 currentTexture = texture;
                 altCurrentTexture = texture;  // Default alt texture to same as primary
                 texture.style.borderColor = "rgb(245 140 44)";  // Orange for primary (shown since blend=0)
@@ -322,13 +359,20 @@ export function createDemo(divId) {
 
         ca.paint(0, 0, 10000, 0, [0.5, 0.5]);
 
-        ca.clearCircle(0, 0, 1000);
+        // Note: Initialization (clearCircle or initRDStyle) is done in the constructor
+        // based on the model type, so we don't need to call it here again.
         ca.alignment = params.alignment;
         ca.rotationAngle = params.rotationAngle;
         ca.blendFactor = params.blendFactor;
         ca.invertColors = params.invertColors;
         ca.weightPruningFraction = params.weightPruningFraction;
         ca.neuronPruningFraction = params.neuronPruningFraction;
+
+        // Sync RD Mode checkbox with model's isRD state
+        const rdModeCheckbox = $('#rdMode');
+        if (rdModeCheckbox) {
+            rdModeCheckbox.checked = ca.isRD;
+        }
 
         // Populate channel checkboxes with RGB and hidden channels
         populateChannelCheckboxes();
@@ -549,8 +593,15 @@ export function createDemo(divId) {
         $('#reset').onclick = () => {
             ca.paint(0, 0, 10000, 0, [0.5, 0.5]);
 
-            ca.clearCircle(0, 0, 1000);
-
+            // Use initialization type from dropdown
+            const initType = $('#initType').value;
+            if (initType === 'gaussian_blobs') {
+                ca.initRDStyle(0.01, 3.0);
+            } else if (initType === 'center_seed') {
+                ca.initCenterSeed();
+            } else {
+                ca.clearCircle(0, 0, 1000);
+            }
         };
         // $('#benchmark').onclick = () => {
         //     ca.benchmark();
@@ -684,6 +735,20 @@ export function createDemo(divId) {
             params.invertColors = $('#invertColors').checked;
             if (ca) {
                 ca.invertColors = params.invertColors;
+            }
+        };
+
+        // RD Mode checkbox - enables Reaction-Diffusion mode
+        $('#rdMode').onchange = () => {
+            const isRD = $('#rdMode').checked;
+            if (ca) {
+                ca.setRDMode(isRD);
+                // Reinitialize with appropriate initial conditions
+                if (isRD) {
+                    ca.initRDStyle(0.01, 3.0);
+                } else {
+                    ca.clearCircle(0, 0, 10000);
+                }
             }
         };
 

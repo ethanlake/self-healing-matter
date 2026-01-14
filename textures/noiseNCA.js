@@ -279,8 +279,8 @@ const PROGRAMS = {
     const highp mat3 lapX = mat3(0.5, 0.0, 0.5, 2.0, -6.0, 2.0, 0.5, 0.0, 0.5);
     const highp mat3 lapY = mat3(0.5, 2.0, 0.5, 0.0, -6.0, 0.0, 0.5, 2.0, 0.5);
 
-    // Isotropic Laplacian for RD models (unnormalized, same as Python)
-    const highp mat3 laplacian = mat3(1.0, 2.0, 1.0, 2.0, -12.0, 2.0, 1.0, 2.0, 1.0);
+    // Isotropic Laplacian for RD models (normalized by 16, same as Python training)
+    const highp mat3 laplacian = mat3(1.0/16.0, 2.0/16.0, 1.0/16.0, 2.0/16.0, -12.0/16.0, 2.0/16.0, 1.0/16.0, 2.0/16.0, 1.0/16.0);
 
     vec4 conv3x3(vec2 xy, float inputCh, mat3 filter) {
         highp vec4 a = vec4(0.0);
@@ -295,6 +295,7 @@ const PROGRAMS = {
     uniform float u_seed, u_updateProbability;
     uniform float u_dx, u_dy;
     uniform float u_isRD;  // 1.0 for RD models, 0.0 for NCA models
+    uniform float u_growingMode;  // 1.0 for Growing NCA models (normalized Sobel filters)
 
     void main() {
         vec2 xy = getOutputXY();
@@ -327,11 +328,14 @@ const PROGRAMS = {
             }
         } else {
             // Standard NCA model: identity, sobel_x, sobel_y, laplacian (4 filters)
+            // Growing NCA mode: Sobel filters are normalized by 8.0 (like Growing NCA paper)
+            float sobelNorm = u_growingMode > 0.5 ? 8.0 : 1.0;
+
             if (filterBand < 0.5) {
                 setOutput(u_input_read(xy, inputCh));
             } else if (filterBand < 2.5) {
-                highp vec4 dx = conv3x3(xy, inputCh, sobelX) / u_dx;
-                highp vec4 dy = conv3x3(xy, inputCh, sobelY) / u_dy;
+                highp vec4 dx = conv3x3(xy, inputCh, sobelX) / (u_dx * sobelNorm);
+                highp vec4 dy = conv3x3(xy, inputCh, sobelY) / (u_dy * sobelNorm);
                 highp vec2 dir = getCellDirection(xy);
                 float s = dir.x, c = dir.y;
                 highp vec4 res = filterBand < 1.5 ? dx*c-dy*s: dx*s+dy*c;
@@ -450,6 +454,8 @@ const PROGRAMS = {
     uniform vec2 u_dropoutMask_size;
     uniform float u_seed, u_updateProbability, u_epsilon;
     uniform float u_dt;
+    uniform float u_growingMode;  // 1.0 for Growing NCA (stochastic fire_rate=0.5)
+    uniform float u_fireRate;     // Stochastic update rate (default 0.5 for growing mode)
     varying vec2 uv;
 
     void main() {
@@ -475,6 +481,18 @@ const PROGRAMS = {
       highp vec4 noise = (hash44(vec4(xy, ch, u_seed)) - 0.5) * u_epsilon;  // uniform on [-ε/2, ε/2]
       highp vec4 newState = state + u_dt * ((1.0 - u_epsilon) * update + noise);
 
+      // Growing NCA: stochastic cell updates (fire_rate = 0.5)
+      // Only some cells update each step - helps prevent runaway dynamics
+      if (u_growingMode > 0.5) {
+          // Use spatial hash to determine if this cell fires
+          // Only channel 0 decides (same mask for all channels at this pixel)
+          float fireRoll = hash13(vec3(xy, u_seed));
+          if (fireRoll > u_fireRate) {
+              // This cell doesn't fire - keep original state
+              newState = state;
+          }
+      }
+
       // Apply channel dropout mask
       float ch4 = ch;
       vec4 maskVec = texture2D(u_dropoutMask, vec2((ch4 + 0.5) / u_dropoutMask_size.x, 0.5));
@@ -490,6 +508,8 @@ const PROGRAMS = {
     uniform float u_seed, u_updateProbability, u_epsilon;
     uniform float u_dt;
     uniform float u_blendFactor;
+    uniform float u_growingMode;  // 1.0 for Growing NCA (stochastic fire_rate=0.5)
+    uniform float u_fireRate;     // Stochastic update rate (default 0.5 for growing mode)
     varying vec2 uv;
 
     void main() {
@@ -503,10 +523,164 @@ const PROGRAMS = {
       highp vec4 noise = (hash44(vec4(xy, ch, u_seed)) - 0.5) * u_epsilon;  // uniform on [-ε/2, ε/2]
       highp vec4 newState = state + u_dt * ((1.0 - u_epsilon) * blendedUpdate + noise);
 
+      // Growing NCA: stochastic cell updates (fire_rate = 0.5)
+      if (u_growingMode > 0.5) {
+          float fireRoll = hash13(vec3(xy, u_seed));
+          if (fireRoll > u_fireRate) {
+              newState = state;  // This cell doesn't fire
+          }
+      }
+
       // Apply channel dropout mask
       float ch4 = ch;
       vec4 maskVec = texture2D(u_dropoutMask, vec2((ch4 + 0.5) / u_dropoutMask_size.x, 0.5));
       newState = newState * maskVec;  // Multiply by mask (0.0 = dropped out)
+
+      setOutput(newState);
+    }`,
+    rdUpdate: `
+    // RD-specific update: combines reaction term (from FC) with diffusion term (laplacian)
+    ${defInput('u_update')}
+    uniform sampler2D u_dropoutMask;
+    uniform vec2 u_dropoutMask_size;
+    uniform sampler2D u_diffCoefTex;  // Diffusion coefficients texture
+    uniform vec2 u_diffCoefTex_size;  // Size of diff coef texture
+    uniform float u_seed, u_updateProbability, u_epsilon;
+    uniform float u_dt;
+    uniform float u_reactionRate;    // Reaction rate scaling
+    uniform float u_diffusionRate;   // Diffusion rate scaling
+    varying vec2 uv;
+
+    // Read diffusion coefficient from texture
+    float getDiffCoef(float channelIdx) {
+        // Diffusion coefficients are stored in a 1D texture, 4 values per RGBA pixel
+        float pixelIdx = floor(channelIdx / 4.0);
+        float componentIdx = mod(channelIdx, 4.0);
+        vec4 pixel = texture2D(u_diffCoefTex, vec2((pixelIdx + 0.5) / u_diffCoefTex_size.x, 0.5));
+        if (componentIdx < 0.5) return pixel.r;
+        else if (componentIdx < 1.5) return pixel.g;
+        else if (componentIdx < 2.5) return pixel.b;
+        else return pixel.a;
+    }
+
+    // Isotropic Laplacian (normalized by 16, same as Python training)
+    vec4 computeLaplacian(vec2 xy, float ch) {
+        highp vec4 sum = vec4(0.0);
+        // Laplacian kernel weights (normalized)
+        // [[1, 2, 1], [2, -12, 2], [1, 2, 1]] / 16
+        sum += u_input_read(xy + vec2(-1.0, -1.0), ch) * (1.0/16.0);
+        sum += u_input_read(xy + vec2( 0.0, -1.0), ch) * (2.0/16.0);
+        sum += u_input_read(xy + vec2( 1.0, -1.0), ch) * (1.0/16.0);
+        sum += u_input_read(xy + vec2(-1.0,  0.0), ch) * (2.0/16.0);
+        sum += u_input_read(xy + vec2( 0.0,  0.0), ch) * (-12.0/16.0);
+        sum += u_input_read(xy + vec2( 1.0,  0.0), ch) * (2.0/16.0);
+        sum += u_input_read(xy + vec2(-1.0,  1.0), ch) * (1.0/16.0);
+        sum += u_input_read(xy + vec2( 0.0,  1.0), ch) * (2.0/16.0);
+        sum += u_input_read(xy + vec2( 1.0,  1.0), ch) * (1.0/16.0);
+        return sum;
+    }
+
+    void main() {
+      vec2 xy = getOutputXY();
+      float ch = getOutputChannel();
+      highp vec4 state = u_input_read(xy, ch);
+
+      // Reaction term from FC layers
+      highp vec4 reaction = u_update_readUV(uv);
+
+      // Diffusion term: laplacian * per-channel diffusion coefficient
+      highp vec4 laplacian = computeLaplacian(xy, ch);
+      // Apply per-channel diffusion coefficients from texture
+      float baseChIdx = ch * 4.0;
+      highp vec4 diffCoefs = vec4(
+          getDiffCoef(baseChIdx),
+          getDiffCoef(baseChIdx + 1.0),
+          getDiffCoef(baseChIdx + 2.0),
+          getDiffCoef(baseChIdx + 3.0)
+      );
+      highp vec4 diffusion = laplacian * diffCoefs * u_diffusionRate;
+
+      // RD update: state + dt * (diffusion + reaction * reactionRate)
+      highp vec4 noise = (hash44(vec4(xy, ch, u_seed)) - 0.5) * u_epsilon;
+      highp vec4 newState = state + u_dt * (diffusion + reaction * u_reactionRate) + noise * u_epsilon;
+
+      // Apply channel dropout mask
+      float ch4 = ch;
+      vec4 maskVec = texture2D(u_dropoutMask, vec2((ch4 + 0.5) / u_dropoutMask_size.x, 0.5));
+      newState = newState * maskVec;
+
+      setOutput(newState);
+    }`,
+    blendedRdUpdate: `
+    // Blended RD update: blends two reaction terms with shared diffusion
+    ${defInput('u_update')}
+    ${defInput('u_altUpdate')}
+    uniform sampler2D u_dropoutMask;
+    uniform vec2 u_dropoutMask_size;
+    uniform sampler2D u_diffCoefTex;  // Diffusion coefficients texture
+    uniform vec2 u_diffCoefTex_size;  // Size of diff coef texture
+    uniform float u_seed, u_updateProbability, u_epsilon;
+    uniform float u_dt;
+    uniform float u_reactionRate;    // Reaction rate scaling
+    uniform float u_diffusionRate;   // Diffusion rate scaling
+    uniform float u_blendFactor;     // Blend factor between two models
+    varying vec2 uv;
+
+    // Read diffusion coefficient from texture
+    float getDiffCoef(float channelIdx) {
+        float pixelIdx = floor(channelIdx / 4.0);
+        float componentIdx = mod(channelIdx, 4.0);
+        vec4 pixel = texture2D(u_diffCoefTex, vec2((pixelIdx + 0.5) / u_diffCoefTex_size.x, 0.5));
+        if (componentIdx < 0.5) return pixel.r;
+        else if (componentIdx < 1.5) return pixel.g;
+        else if (componentIdx < 2.5) return pixel.b;
+        else return pixel.a;
+    }
+
+    // Isotropic Laplacian (normalized by 16, same as Python training)
+    vec4 computeLaplacian(vec2 xy, float ch) {
+        highp vec4 sum = vec4(0.0);
+        sum += u_input_read(xy + vec2(-1.0, -1.0), ch) * (1.0/16.0);
+        sum += u_input_read(xy + vec2( 0.0, -1.0), ch) * (2.0/16.0);
+        sum += u_input_read(xy + vec2( 1.0, -1.0), ch) * (1.0/16.0);
+        sum += u_input_read(xy + vec2(-1.0,  0.0), ch) * (2.0/16.0);
+        sum += u_input_read(xy + vec2( 0.0,  0.0), ch) * (-12.0/16.0);
+        sum += u_input_read(xy + vec2( 1.0,  0.0), ch) * (2.0/16.0);
+        sum += u_input_read(xy + vec2(-1.0,  1.0), ch) * (1.0/16.0);
+        sum += u_input_read(xy + vec2( 0.0,  1.0), ch) * (2.0/16.0);
+        sum += u_input_read(xy + vec2( 1.0,  1.0), ch) * (1.0/16.0);
+        return sum;
+    }
+
+    void main() {
+      vec2 xy = getOutputXY();
+      float ch = getOutputChannel();
+      highp vec4 state = u_input_read(xy, ch);
+
+      // Blend reaction terms from both models
+      highp vec4 reaction1 = u_update_readUV(uv);
+      highp vec4 reaction2 = u_altUpdate_readUV(uv);
+      highp vec4 reaction = mix(reaction1, reaction2, u_blendFactor);
+
+      // Diffusion term: laplacian * per-channel diffusion coefficient
+      highp vec4 laplacian = computeLaplacian(xy, ch);
+      float baseChIdx = ch * 4.0;
+      highp vec4 diffCoefs = vec4(
+          getDiffCoef(baseChIdx),
+          getDiffCoef(baseChIdx + 1.0),
+          getDiffCoef(baseChIdx + 2.0),
+          getDiffCoef(baseChIdx + 3.0)
+      );
+      highp vec4 diffusion = laplacian * diffCoefs * u_diffusionRate;
+
+      // RD update with blended reaction: state + dt * (diffusion + reaction * reactionRate)
+      highp vec4 noise = (hash44(vec4(xy, ch, u_seed)) - 0.5) * u_epsilon;
+      highp vec4 newState = state + u_dt * (diffusion + reaction * u_reactionRate) + noise * u_epsilon;
+
+      // Apply channel dropout mask
+      float ch4 = ch;
+      vec4 maskVec = texture2D(u_dropoutMask, vec2((ch4 + 0.5) / u_dropoutMask_size.x, 0.5));
+      newState = newState * maskVec;
 
       setOutput(newState);
     }`,
@@ -789,6 +963,32 @@ function createDropoutMaskTexture(gl, channelCount, mask) {
     });
 }
 
+function createDiffCoefTexture(gl, diffCoefArray) {
+    // Pack diffusion coefficients into RGBA texture (4 channels per pixel)
+    // diffCoefArray is an array of per-channel diffusion coefficients
+    const channelCount = diffCoefArray.length;
+    const width = Math.ceil(channelCount / 4);
+    const data = new Float32Array(width * 4);
+
+    for (let i = 0; i < channelCount; i++) {
+        data[i] = diffCoefArray[i];
+    }
+    // Pad remaining with 0.0
+    for (let i = channelCount; i < width * 4; i++) {
+        data[i] = 0.0;
+    }
+
+    return twgl.createTexture(gl, {
+        minMag: gl.NEAREST,
+        src: data,
+        width: width,
+        height: 1,
+        internalFormat: gl.RGBA32F,
+        format: gl.RGBA,
+        type: gl.FLOAT,
+    });
+}
+
 function detectModelType(models, channel_n = 12) {
     // Detect if model is RD or NCA based on layer 0 input dimensions
     if (!models.layers || models.layers.length < 1) {
@@ -808,8 +1008,10 @@ function detectModelType(models, channel_n = 12) {
     // Subtract 1 from input_dim if bias is present (bias row at end)
     const input_dim = layer0.bias ? layer0_shape[0] - 1 : layer0_shape[0];
 
-    if (input_dim === 2 * channel_n) {
-        console.log(`Detected RD model: input_dim=${input_dim} = 2 × ${channel_n} (identity + laplacian)`);
+    // RD models: w1 takes raw state directly (channel_n inputs, no perception)
+    // NCA models: w1 takes perception vector (4 * channel_n inputs)
+    if (input_dim === channel_n) {
+        console.log(`Detected RD model: input_dim=${input_dim} = ${channel_n} (state-only, no perception)`);
         return 'rd';
     } else if (input_dim === 4 * channel_n) {
         console.log(`Detected NCA model: input_dim=${input_dim} = 4 × ${channel_n} (identity + sobel_x + sobel_y + laplacian)`);
@@ -843,7 +1045,8 @@ export class NoiseNCA {
         this.circular_padding = true;
 
         this.rotationAngle = 0.0;
-        this.dt = 1.0;
+        // Use dt from model JSON if present, otherwise default to 1.0
+        this.dt = models.dt !== undefined ? models.dt : 1.0;
         this.dx = 1.0;
         this.dy = 1.0;
         this.epsilon = 0.0;
@@ -857,6 +1060,36 @@ export class NoiseNCA {
         this.invertColors = false;
 
         this.noise_level = models.noise_level;
+
+        // Store RD-specific hyperparameters from training
+        // Default diffusion coefficients: [0.125, 0.25, 0.5, 1.0] repeated for 12 channels
+        this.diff_coef = models.diff_coef || [0.125, 0.25, 0.5, 1.0, 0.125, 0.25, 0.5, 1.0, 0.125, 0.25, 0.5, 1.0];
+        this.reaction_rate = models.reaction_rate !== undefined ? models.reaction_rate : 1.0;
+        this.diffusion_rate = models.diffusion_rate !== undefined ? models.diffusion_rate : 1.0;
+        this.seed_type = models.seed_type || 'gaussian_blobs';
+
+        // Growing NCA mode: uses normalized Sobel filters and stochastic updates
+        // Detected from model JSON or can be set manually
+        this.growingMode = models.growing_mode || false;
+        this.fireRate = models.fire_rate !== undefined ? models.fire_rate : 0.5;
+
+        // Log hyperparameters if RD model
+        if (this.isRD) {
+            console.log('RD Model hyperparameters from JSON:');
+            console.log('  dt:', this.dt);
+            console.log('  noise_level:', this.noise_level);
+            console.log('  diff_coef:', this.diff_coef);
+            console.log('  reaction_rate:', this.reaction_rate);
+            console.log('  diffusion_rate:', this.diffusion_rate);
+            console.log('  seed_type:', this.seed_type);
+        }
+
+        // Log if Growing NCA mode
+        if (this.growingMode) {
+            console.log('Growing NCA mode enabled:');
+            console.log('  growingMode:', this.growingMode);
+            console.log('  fireRate:', this.fireRate);
+        }
 
         this.layers = [];
         this.altLayers = [];  // Alternate texture weights for blending
@@ -880,6 +1113,9 @@ export class NoiseNCA {
         // Channel dropout system
         this.channelDropoutMask = null;         // Float32Array, length = channelCount, 1.0=active, 0.0=dropped
         this.dropoutMaskTex = null;             // Texture containing dropout mask
+
+        // RD diffusion coefficient texture
+        this.diffCoefTex = null;                // Texture containing per-channel diffusion coefficients
 
         this.setWeights(models);
 
@@ -915,7 +1151,14 @@ export class NoiseNCA {
 
         }
 
-        this.clearCircle(0, 0, 10000);
+        // Use appropriate initialization based on model type
+        if (this.isRD) {
+            // RD models need gaussian blob initialization with zero hidden channels
+            this.initRDStyle(0.01, 3.0);
+        } else {
+            // NCA models use uniform random noise
+            this.clearCircle(0, 0, 10000);
+        }
     }
 
     setupBuffers() {
@@ -985,6 +1228,14 @@ export class NoiseNCA {
         // Create dropout mask texture
         this.dropoutMaskTex = createDropoutMaskTexture(gl, channel_n, this.channelDropoutMask);
 
+        // Create diffusion coefficient texture for RD models
+        // Ensure we have exactly channel_n coefficients
+        let diffCoefs = this.diff_coef.slice(0, channel_n);
+        // Pad if needed
+        while (diffCoefs.length < channel_n) {
+            diffCoefs.push(this.diff_coef[diffCoefs.length % this.diff_coef.length]);
+        }
+        this.diffCoefTex = createDiffCoefTexture(gl, diffCoefs);
 
         // For now we only support multi-scale perception with 2 scales
 
@@ -1014,16 +1265,30 @@ export class NoiseNCA {
         }
 
         if (stage == 'all' || stage == 'Perception') {
-            this.runLayer(self.progs.perception, this.buf.perception0, {
-                u_input: this.buf.state, u_angle: this.rotationAngle / 180.0 * Math.PI,
-                u_alignment: this.alignment, u_hexGrid: this.hexGrid, u_dx: this.dx, u_dy: this.dy,
-                u_seed: seed, u_updateProbability: this.updateProbability,
-                u_isRD: this.isRD ? 1.0 : 0.0,
-            });
+            if (this.isRD) {
+                // For RD models: skip perception, use state directly as input to FC layers
+                // The laplacian will be computed in the update shader
+                this.runLayer(self.progs.perception, this.buf.perception0, {
+                    u_input: this.buf.state, u_angle: this.rotationAngle / 180.0 * Math.PI,
+                    u_alignment: this.alignment, u_hexGrid: this.hexGrid, u_dx: this.dx, u_dy: this.dy,
+                    u_seed: seed, u_updateProbability: this.updateProbability,
+                    u_isRD: 0.0,  // Use identity-only perception (filterBand 0)
+                    u_rdStateOnly: 1.0,  // Signal to only copy state, no filters
+                });
+            } else {
+                this.runLayer(self.progs.perception, this.buf.perception0, {
+                    u_input: this.buf.state, u_angle: this.rotationAngle / 180.0 * Math.PI,
+                    u_alignment: this.alignment, u_hexGrid: this.hexGrid, u_dx: this.dx, u_dy: this.dy,
+                    u_seed: seed, u_updateProbability: this.updateProbability,
+                    u_isRD: 0.0,
+                    u_growingMode: this.growingMode ? 1.0 : 0.0,
+                });
+            }
         }
 
 
-        let inputBuf = this.buf.perception0;
+        // For RD models, use state buffer directly; for NCA, use perception
+        let inputBuf = this.isRD ? this.buf.state : this.buf.perception0;
 
         // Compute primary texture update
         for (let i = 0; i < this.layers.length; ++i) {
@@ -1035,7 +1300,8 @@ export class NoiseNCA {
         
         // Compute alternate texture update if we have alt weights and blending
         const hasAltLayers = this.altLayers && this.altLayers.length > 0 && this.altLayers.every(l => l.ready);
-        let altInputBuf = this.buf.perception0;
+        // For RD models, use state buffer directly; for NCA, use perception
+        let altInputBuf = this.isRD ? this.buf.state : this.buf.perception0;
         
         if (hasAltLayers && this.blendFactor > 0) {
             for (let i = 0; i < this.altLayers.length; ++i) {
@@ -1047,15 +1313,44 @@ export class NoiseNCA {
         }
         
         if (stage == 'all' || stage == 'Update') {
-            if (hasAltLayers && this.blendFactor > 0) {
-                // Use blended update shader
+            if (this.isRD && hasAltLayers && this.blendFactor > 0) {
+                // Use blended RD update shader (blend two reaction terms with shared diffusion)
+                this.runLayer(this.progs.blendedRdUpdate, this.buf.newState, {
+                    u_input: this.buf.state, u_update: inputBuf, u_altUpdate: altInputBuf,
+                    u_unshuffleTex: this.unshuffleTex, u_dt: this.dt, u_epsilon: this.epsilon,
+                    u_seed: seed, u_updateProbability: this.updateProbability,
+                    u_blendFactor: this.blendFactor,
+                    u_dropoutMask: this.dropoutMaskTex,
+                    u_dropoutMask_size: [Math.ceil(this.channelCount / 4), 1],
+                    u_diffCoefTex: this.diffCoefTex,
+                    u_diffCoefTex_size: [Math.ceil(this.channelCount / 4), 1],
+                    u_reactionRate: this.reaction_rate,
+                    u_diffusionRate: this.diffusion_rate
+                });
+            } else if (this.isRD) {
+                // Use RD-specific update shader that computes laplacian diffusion term
+                this.runLayer(this.progs.rdUpdate, this.buf.newState, {
+                    u_input: this.buf.state, u_update: inputBuf,
+                    u_unshuffleTex: this.unshuffleTex, u_dt: this.dt, u_epsilon: this.epsilon,
+                    u_seed: seed, u_updateProbability: this.updateProbability,
+                    u_dropoutMask: this.dropoutMaskTex,
+                    u_dropoutMask_size: [Math.ceil(this.channelCount / 4), 1],
+                    u_diffCoefTex: this.diffCoefTex,
+                    u_diffCoefTex_size: [Math.ceil(this.channelCount / 4), 1],
+                    u_reactionRate: this.reaction_rate,
+                    u_diffusionRate: this.diffusion_rate
+                });
+            } else if (hasAltLayers && this.blendFactor > 0) {
+                // Use blended update shader for NCA
                 this.runLayer(this.progs.blendedUpdate, this.buf.newState, {
                     u_input: this.buf.state, u_update: inputBuf, u_altUpdate: altInputBuf,
                     u_unshuffleTex: this.unshuffleTex, u_dt: this.dt, u_epsilon: this.epsilon,
                     u_seed: seed, u_updateProbability: this.updateProbability,
                     u_blendFactor: this.blendFactor,
                     u_dropoutMask: this.dropoutMaskTex,
-                    u_dropoutMask_size: [Math.ceil(this.channelCount / 4), 1]
+                    u_dropoutMask_size: [Math.ceil(this.channelCount / 4), 1],
+                    u_growingMode: this.growingMode ? 1.0 : 0.0,
+                    u_fireRate: this.fireRate,
                 });
             } else {
                 // Use regular update shader (no blending)
@@ -1064,7 +1359,9 @@ export class NoiseNCA {
                     u_unshuffleTex: this.unshuffleTex, u_dt: this.dt, u_epsilon: this.epsilon,
                     u_seed: seed, u_updateProbability: this.updateProbability,
                     u_dropoutMask: this.dropoutMaskTex,
-                    u_dropoutMask_size: [Math.ceil(this.channelCount / 4), 1]
+                    u_dropoutMask_size: [Math.ceil(this.channelCount / 4), 1],
+                    u_growingMode: this.growingMode ? 1.0 : 0.0,
+                    u_fireRate: this.fireRate,
                 });
             }
         }
@@ -1170,6 +1467,281 @@ export class NoiseNCA {
             u_control: false,
             u_noise_level: 1.0,
         });
+    }
+
+    // RD-style initialization: gaussian blobs in RGB, zeros in hidden channels
+    initRDStyle(spotProb = 0.01, spread = 3.0) {
+        const gl = this.gl;
+        const [w, h] = this.gridSize;
+        const channelCount = this.channelCount;
+
+        // Create gaussian blob pattern on CPU
+        // Step 1: Create sparse random spots
+        const spots = new Float32Array(w * h);
+        for (let i = 0; i < w * h; i++) {
+            spots[i] = Math.random() < spotProb ? 1.0 : 0.0;
+        }
+
+        // Step 2: Apply Gaussian blur (simple box blur approximation, repeated)
+        const blurred = new Float32Array(w * h);
+        const temp = new Float32Array(w * h);
+
+        // Copy spots to blurred
+        for (let i = 0; i < spots.length; i++) {
+            blurred[i] = spots[i];
+        }
+
+        // Apply blur passes (approximate gaussian with repeated box blur)
+        const blurPasses = Math.ceil(spread);
+        for (let pass = 0; pass < blurPasses; pass++) {
+            // Horizontal pass
+            for (let y = 0; y < h; y++) {
+                for (let x = 0; x < w; x++) {
+                    let sum = 0;
+                    for (let dx = -1; dx <= 1; dx++) {
+                        const nx = (x + dx + w) % w;  // Circular padding
+                        sum += blurred[y * w + nx];
+                    }
+                    temp[y * w + x] = sum / 3.0;
+                }
+            }
+            // Vertical pass
+            for (let y = 0; y < h; y++) {
+                for (let x = 0; x < w; x++) {
+                    let sum = 0;
+                    for (let dy = -1; dy <= 1; dy++) {
+                        const ny = (y + dy + h) % h;  // Circular padding
+                        sum += temp[ny * w + x];
+                    }
+                    blurred[y * w + x] = sum / 3.0;
+                }
+            }
+        }
+
+        // Scale by spread^2 to compensate for blur normalization
+        const scale = spread * spread;
+        for (let i = 0; i < blurred.length; i++) {
+            blurred[i] *= scale;
+        }
+
+        // Step 3: Create state tensor data
+        // State is stored as packed RGBA textures in a grid
+        const depth4 = Math.ceil(channelCount / 4);
+        const gridW = Math.ceil(Math.sqrt(depth4));
+        const gridH = Math.floor((depth4 + gridW - 1) / gridW);
+        const texW = w * gridW;
+        const texH = h * gridH;
+
+        const stateData = new Float32Array(texW * texH * 4);
+
+        // Fill the state data
+        for (let ch4 = 0; ch4 < depth4; ch4++) {
+            const tileX = ch4 % gridW;
+            const tileY = Math.floor(ch4 / gridW);
+
+            for (let y = 0; y < h; y++) {
+                for (let x = 0; x < w; x++) {
+                    const texX = tileX * w + x;
+                    const texY = tileY * h + y;
+                    const texIdx = (texY * texW + texX) * 4;
+
+                    const spatialIdx = y * w + x;
+                    const blobVal = blurred[spatialIdx];
+
+                    // For each of the 4 channels in this pack
+                    for (let c = 0; c < 4; c++) {
+                        const channelIdx = ch4 * 4 + c;
+                        if (channelIdx < channelCount) {
+                            if (channelIdx < 3) {
+                                // RGB channels: gaussian blobs, centered around 0 (display adds 0.5)
+                                stateData[texIdx + c] = blobVal - 0.5;
+                            } else {
+                                // Hidden channels: exactly 0
+                                stateData[texIdx + c] = 0.0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Upload to GPU
+        twgl.setTextureFromArray(gl, this.buf.state.tex, stateData, {
+            width: texW,
+            height: texH,
+            format: gl.RGBA,
+            internalFormat: gl.RGBA32F,
+            type: gl.FLOAT,
+            minMag: gl.NEAREST,
+        });
+
+        console.log(`Initialized RD-style: ${w}x${h}, spotProb=${spotProb}, spread=${spread}`);
+    }
+
+    // Growing NCA-style initialization: zeros everywhere, hidden channels activated at center
+    // This matches the seed from nca_experiments.ipynb / Growing NCA paper
+    initCenterSeed() {
+        const gl = this.gl;
+        const [w, h] = this.gridSize;
+        const channelCount = this.channelCount;
+
+        // State is stored as packed RGBA textures in a grid
+        const depth4 = Math.ceil(channelCount / 4);
+        const gridW = Math.ceil(Math.sqrt(depth4));
+        const gridH = Math.floor((depth4 + gridW - 1) / gridW);
+        const texW = w * gridW;
+        const texH = h * gridH;
+
+        const stateData = new Float32Array(texW * texH * 4);
+
+        // Center coordinates
+        const centerX = Math.floor(w / 2);
+        const centerY = Math.floor(h / 2);
+
+        // Fill the state data
+        for (let ch4 = 0; ch4 < depth4; ch4++) {
+            const tileX = ch4 % gridW;
+            const tileY = Math.floor(ch4 / gridW);
+
+            for (let y = 0; y < h; y++) {
+                for (let x = 0; x < w; x++) {
+                    const texX = tileX * w + x;
+                    const texY = tileY * h + y;
+                    const texIdx = (texY * texW + texX) * 4;
+
+                    const isCenter = (x === centerX && y === centerY);
+
+                    // For each of the 4 channels in this pack
+                    for (let c = 0; c < 4; c++) {
+                        const channelIdx = ch4 * 4 + c;
+                        if (channelIdx < channelCount) {
+                            if (channelIdx < 3) {
+                                // RGB channels: always 0 (will display as 0.5 gray)
+                                stateData[texIdx + c] = 0.0;
+                            } else {
+                                // Hidden channels (3+): 1.0 at center, 0.0 elsewhere
+                                stateData[texIdx + c] = isCenter ? 1.0 : 0.0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Upload to GPU
+        twgl.setTextureFromArray(gl, this.buf.state.tex, stateData, {
+            width: texW,
+            height: texH,
+            format: gl.RGBA,
+            internalFormat: gl.RGBA32F,
+            type: gl.FLOAT,
+            minMag: gl.NEAREST,
+        });
+
+        console.log(`Initialized center seed: ${w}x${h}, center=(${centerX}, ${centerY})`);
+    }
+
+    // Manually set RD mode (for models that aren't auto-detected)
+    setRDMode(isRD) {
+        this.isRD = isRD;
+        console.log(`RD Mode ${isRD ? 'enabled' : 'disabled'}`);
+    }
+
+    // Debug: read buffer values and print stats
+    debugReadBuffer(bufName = 'state') {
+        const gl = this.gl;
+        const buf = this.buf[bufName];
+        if (!buf) {
+            console.error(`Buffer '${bufName}' not found`);
+            return;
+        }
+        twgl.bindFramebufferInfo(gl, buf.fbi);
+        const data = new Float32Array(buf.fbi.width * buf.fbi.height * 4);
+        gl.readPixels(0, 0, buf.fbi.width, buf.fbi.height, gl.RGBA, gl.FLOAT, data);
+
+        let min = Infinity, max = -Infinity, sum = 0, nanCount = 0;
+        for (let i = 0; i < data.length; i++) {
+            if (isNaN(data[i])) {
+                nanCount++;
+            } else {
+                min = Math.min(min, data[i]);
+                max = Math.max(max, data[i]);
+                sum += data[i];
+            }
+        }
+        const mean = sum / (data.length - nanCount);
+        console.log(`Buffer '${bufName}': min=${min.toFixed(4)}, max=${max.toFixed(4)}, mean=${mean.toFixed(4)}, NaN count=${nanCount}`);
+        return { min, max, mean, nanCount, data };
+    }
+
+    // Debug: run one step and print all buffer states
+    debugStep() {
+        console.log("=== Before step ===");
+        this.debugReadBuffer('state');
+
+        console.log("=== Running step ===");
+        console.log("isRD:", this.isRD);
+        console.log("Layer dimensions:", this.layers.map((l, i) => `L${i}: ${l.in_n}->${l.out_n}`).join(", "));
+
+        // Run perception
+        const seed = Math.random() * 1000;
+        if (this.isRD) {
+            console.log("Skipping perception (RD mode - using state directly)");
+        } else {
+            this.runLayer(self.progs.perception, this.buf.perception0, {
+                u_input: this.buf.state, u_angle: this.rotationAngle / 180.0 * Math.PI,
+                u_alignment: this.alignment, u_hexGrid: this.hexGrid, u_dx: this.dx, u_dy: this.dy,
+                u_seed: seed, u_updateProbability: this.updateProbability,
+                u_isRD: 0.0,
+            });
+            console.log("After perception:");
+            this.debugReadBuffer('perception0');
+        }
+
+        // Run FC layers
+        let inputBuf = this.isRD ? this.buf.state : this.buf.perception0;
+        for (let i = 0; i < this.layers.length; i++) {
+            const relu = i === 0;
+            this.runDense(this.buf[`layer${i}`], inputBuf, this.layers[i], relu, seed);
+            console.log(`After layer${i} (relu=${relu}):`);
+            this.debugReadBuffer(`layer${i}`);
+            inputBuf = this.buf[`layer${i}`];
+        }
+
+        // Run update
+        if (this.isRD) {
+            console.log("Running RD update (with diffusion)...");
+            console.log(`  dt=${this.dt}, reaction_rate=${this.reaction_rate}, diffusion_rate=${this.diffusion_rate}`);
+            this.runLayer(this.progs.rdUpdate, this.buf.newState, {
+                u_input: this.buf.state, u_update: inputBuf,
+                u_unshuffleTex: this.unshuffleTex, u_dt: this.dt, u_epsilon: this.epsilon,
+                u_seed: seed, u_updateProbability: this.updateProbability,
+                u_dropoutMask: this.dropoutMaskTex,
+                u_dropoutMask_size: [Math.ceil(this.channelCount / 4), 1],
+                u_diffCoefTex: this.diffCoefTex,
+                u_diffCoefTex_size: [Math.ceil(this.channelCount / 4), 1],
+                u_reactionRate: this.reaction_rate,
+                u_diffusionRate: this.diffusion_rate
+            });
+        } else {
+            console.log("Running standard update...");
+            this.runLayer(this.progs.update, this.buf.newState, {
+                u_input: this.buf.state, u_update: inputBuf,
+                u_unshuffleTex: this.unshuffleTex, u_dt: this.dt, u_epsilon: this.epsilon,
+                u_seed: seed, u_updateProbability: this.updateProbability,
+                u_dropoutMask: this.dropoutMaskTex,
+                u_dropoutMask_size: [Math.ceil(this.channelCount / 4), 1]
+            });
+        }
+
+        console.log("After update:");
+        this.debugReadBuffer('newState');
+
+        // Swap buffers
+        [this.buf.state, this.buf.newState] = [this.buf.newState, this.buf.state];
+
+        console.log("=== After step (final state) ===");
+        this.debugReadBuffer('state');
     }
 
     setWeights(models) {
@@ -1773,6 +2345,15 @@ export class NoiseNCA {
 
     setAltWeights(models) {
         const gl = this.gl;
+
+        // Check if alt model type matches primary model type
+        const altModelType = models.model_type || detectModelType(models.layers, this.channelCount);
+        const altIsRD = (altModelType === 'rd');
+
+        if (altIsRD !== this.isRD) {
+            console.warn(`Warning: Alt model type (${altModelType}) differs from primary model type (${this.isRD ? 'rd' : 'nca'}). Blending may not work correctly.`);
+        }
+
         this.altLayers.forEach(layer => { if (layer.tex) gl.deleteTexture(layer.tex); });
         this.altLayers = models.layers.map(layer => createDenseInfo(gl, layer));
     }
