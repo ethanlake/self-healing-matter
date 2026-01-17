@@ -66,6 +66,11 @@
     "textured_strips",
     "textured_strips_improved",
     "textured_strips_improved_II",
-    "leopard_rd"
+    "leopard_rd",
+    "horiz_to_vert_stripes",
+    "stripes_to_bubbles",
+    "horz_vert_horz",
+    "leopard_zebra",
+    "leopard_zebra_puffer"
   ]
 }

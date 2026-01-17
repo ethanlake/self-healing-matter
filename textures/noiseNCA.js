@@ -282,6 +282,11 @@ const PROGRAMS = {
     // Isotropic Laplacian for RD models (normalized by 16, same as Python training)
     const highp mat3 laplacian = mat3(1.0/16.0, 2.0/16.0, 1.0/16.0, 2.0/16.0, -12.0/16.0, 2.0/16.0, 1.0/16.0, 2.0/16.0, 1.0/16.0);
 
+    uniform float u_seed, u_updateProbability;
+    uniform float u_dx, u_dy;
+    uniform float u_isRD;  // 1.0 for RD models, 0.0 for NCA models
+    uniform float u_growingMode;  // 1.0 for Growing NCA models (normalized Sobel filters)
+
     vec4 conv3x3(vec2 xy, float inputCh, mat3 filter) {
         highp vec4 a = vec4(0.0);
         for (int y=0; y<3; ++y)
@@ -291,11 +296,6 @@ const PROGRAMS = {
         }
         return a;
     }
-
-    uniform float u_seed, u_updateProbability;
-    uniform float u_dx, u_dy;
-    uniform float u_isRD;  // 1.0 for RD models, 0.0 for NCA models
-    uniform float u_growingMode;  // 1.0 for Growing NCA models (normalized Sobel filters)
 
     void main() {
         vec2 xy = getOutputXY();
@@ -332,6 +332,7 @@ const PROGRAMS = {
             float sobelNorm = u_growingMode > 0.5 ? 8.0 : 1.0;
 
             if (filterBand < 0.5) {
+                // Identity filter
                 setOutput(u_input_read(xy, inputCh));
             } else if (filterBand < 2.5) {
                 highp vec4 dx = conv3x3(xy, inputCh, sobelX) / (u_dx * sobelNorm);
@@ -478,8 +479,10 @@ const PROGRAMS = {
         update = u_update_readUV(uv);
         // }
       #endif
-      highp vec4 noise = (hash44(vec4(xy, ch, u_seed)) - 0.5) * u_epsilon;  // uniform on [-ε/2, ε/2]
-      highp vec4 newState = state + u_dt * ((1.0 - u_epsilon) * update + noise);
+      // Noise with sqrt(dt) scaling for correct continuum limit (SDE Euler-Maruyama)
+      // noise ~ epsilon * sqrt(dt) * uniform[-1, 1]
+      highp vec4 noise = (hash44(vec4(xy, ch, u_seed)) - 0.5) * 2.0 * u_epsilon * sqrt(u_dt);
+      highp vec4 newState = state + u_dt * update + noise;
 
       // Growing NCA: stochastic cell updates (fire_rate = 0.5)
       // Only some cells update each step - helps prevent runaway dynamics
@@ -520,8 +523,9 @@ const PROGRAMS = {
       highp vec4 update2 = u_altUpdate_readUV(uv);
       // Blend the two updates: (1-blend)*update1 + blend*update2
       highp vec4 blendedUpdate = mix(update1, update2, u_blendFactor);
-      highp vec4 noise = (hash44(vec4(xy, ch, u_seed)) - 0.5) * u_epsilon;  // uniform on [-ε/2, ε/2]
-      highp vec4 newState = state + u_dt * ((1.0 - u_epsilon) * blendedUpdate + noise);
+      // Noise with sqrt(dt) scaling for correct continuum limit (SDE Euler-Maruyama)
+      highp vec4 noise = (hash44(vec4(xy, ch, u_seed)) - 0.5) * 2.0 * u_epsilon * sqrt(u_dt);
+      highp vec4 newState = state + u_dt * blendedUpdate + noise;
 
       // Growing NCA: stochastic cell updates (fire_rate = 0.5)
       if (u_growingMode > 0.5) {
@@ -601,8 +605,9 @@ const PROGRAMS = {
       highp vec4 diffusion = laplacian * diffCoefs * u_diffusionRate;
 
       // RD update: state + dt * (diffusion + reaction * reactionRate)
-      highp vec4 noise = (hash44(vec4(xy, ch, u_seed)) - 0.5) * u_epsilon;
-      highp vec4 newState = state + u_dt * (diffusion + reaction * u_reactionRate) + noise * u_epsilon;
+      // Noise with sqrt(dt) scaling for correct continuum limit (SDE Euler-Maruyama)
+      highp vec4 noise = (hash44(vec4(xy, ch, u_seed)) - 0.5) * 2.0 * u_epsilon * sqrt(u_dt);
+      highp vec4 newState = state + u_dt * (diffusion + reaction * u_reactionRate) + noise;
 
       // Apply channel dropout mask
       float ch4 = ch;
@@ -674,8 +679,9 @@ const PROGRAMS = {
       highp vec4 diffusion = laplacian * diffCoefs * u_diffusionRate;
 
       // RD update with blended reaction: state + dt * (diffusion + reaction * reactionRate)
-      highp vec4 noise = (hash44(vec4(xy, ch, u_seed)) - 0.5) * u_epsilon;
-      highp vec4 newState = state + u_dt * (diffusion + reaction * u_reactionRate) + noise * u_epsilon;
+      // Noise with sqrt(dt) scaling for correct continuum limit (SDE Euler-Maruyama)
+      highp vec4 noise = (hash44(vec4(xy, ch, u_seed)) - 0.5) * 2.0 * u_epsilon * sqrt(u_dt);
+      highp vec4 newState = state + u_dt * (diffusion + reaction * u_reactionRate) + noise;
 
       // Apply channel dropout mask
       float ch4 = ch;
@@ -1455,7 +1461,7 @@ export class NoiseNCA {
         });
     }
 
-    clearCircle(x, y, r, brush, zoom = 1.0) {
+    clearCircle(x, y, r, brush, zoom = 1.0, noiseLevel = 1.0) {
         let u_seed = Math.random() * 1000.0;
         self.runLayer(self.progs.paint, this.buf.state, {
             u_pos: [x, y],
@@ -1465,7 +1471,7 @@ export class NoiseNCA {
             u_zoom: zoom,
             u_seed: u_seed,
             u_control: false,
-            u_noise_level: 1.0,
+            u_noise_level: noiseLevel,
         });
     }
 

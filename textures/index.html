@@ -335,6 +335,10 @@
                                 <option value="center_seed">Center Seed</option>
                             </select>
                         </label>
+                        <label style="display: flex; align-items: center; gap: 4px;" title="Amplitude of noise in initial state (0 = gray, 1 = full noise)">
+                            Init Noise: <input type="range" id="initNoiseAmplitude" min="0" max="1" step="0.01" value="1" style="width: 80px;">
+                            <span id="initNoiseAmplitudeLabel">1.00</span>
+                        </label>
                         <label style="cursor: pointer;">
                             <input type="checkbox" id="altTexture"> Alt. Texture
                         </label>

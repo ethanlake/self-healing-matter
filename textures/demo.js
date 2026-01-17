@@ -94,6 +94,9 @@ export function createDemo(divId) {
         // Neuron pruning
         neuronPruningFraction: 0.0,
 
+        // Initial noise amplitude (0 = gray, 1 = full noise)
+        initNoiseAmplitude: 1.0,
+
         texture_img: null,
 
         texture_idx: 0,
@@ -600,7 +603,8 @@ export function createDemo(divId) {
             } else if (initType === 'center_seed') {
                 ca.initCenterSeed();
             } else {
-                ca.clearCircle(0, 0, 1000);
+                // Pass noise amplitude for uniform noise initialization
+                ca.clearCircle(0, 0, 1000, null, 1.0, params.initNoiseAmplitude);
             }
         };
         // $('#benchmark').onclick = () => {
@@ -666,6 +670,15 @@ export function createDemo(divId) {
         };
         $('#blendFactor').onchange = updateBlendFactor;
         $('#blendFactor').oninput = updateBlendFactor;
+
+        // Initial noise amplitude slider
+        const updateInitNoiseAmplitude = () => {
+            const val = parseFloat($('#initNoiseAmplitude').value);
+            $('#initNoiseAmplitudeLabel').textContent = val.toFixed(2);
+            params.initNoiseAmplitude = val;
+        };
+        $('#initNoiseAmplitude').onchange = updateInitNoiseAmplitude;
+        $('#initNoiseAmplitude').oninput = updateInitNoiseAmplitude;
 
         // Weight perturbation slider
         const updateWeightPerturbation = () => {
