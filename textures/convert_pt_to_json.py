@@ -40,17 +40,28 @@ def tile2d(a, w=None):
     return a
 
 
-def detect_model_type(state_dict, chn=12):
+def detect_model_type(state_dict, chn=12, training_params=None):
     """
-    Detect if model is RD or NCA based on w1 input dimensions.
+    Detect model type based on training params or w1 input dimensions.
 
     Args:
         state_dict: PyTorch state dictionary
         chn: Number of output channels (default 12)
+        training_params: Optional training parameters dict (may contain explicit model_type)
 
     Returns:
-        'rd' for RD models, 'nca' for NCA models
+        'rd' for RD models, 'nca' for NCA models, 'rotinv_nca' for rotation-invariant NCA
     """
+    # Check training params for explicit model type first
+    if training_params and 'model_type' in training_params:
+        model_type = training_params['model_type']
+        if model_type == 'rotinv_nca':
+            theta_channel = training_params.get('theta_channel', 3)
+            print(f"Detected Rotation-Invariant NCA model (theta_channel={theta_channel})")
+            return 'rotinv_nca'
+        elif model_type in ('rd', 'nca'):
+            return model_type
+
     if 'w1.weight' not in state_dict:
         raise ValueError("Could not find 'w1.weight' in state_dict")
 
@@ -131,12 +142,20 @@ def export_np_models_to_json(np_models, metadata):
     Returns:
         Dictionary in JSON format
     """
+    model_type = metadata.get('model_type', 'nca')
     models_js = {
         'model_names': metadata['model_names'],
         'layers': [],
         'noise_level': np_models[-1],
-        'model_type': metadata.get('model_type', 'nca')  # Add model type to JSON
+        'model_type': model_type
     }
+
+    # Add theta_channel for rotation-invariant NCA models
+    if model_type == 'rotinv_nca':
+        models_js['theta_channel'] = metadata.get('theta_channel', 3)
+
+    # Track actual channel count (before padding)
+    actual_chn = None
 
     for i, layer in enumerate(np_models[:-1]):
         # layer shape: [n, c_in, fc_dim] where n=1 for single model
@@ -156,15 +175,18 @@ def export_np_models_to_json(np_models, metadata):
                 # filter_channels == chn (state channels only)
                 # No rearrangement needed - weights are already in correct order
                 chn = filter_channels
+                actual_chn = chn  # Store actual channel count
                 print(f"RD model layer 0: {chn} state channels (no perception filters)")
 
             else:
-                # Standard NCA 4-filter model
+                # Standard NCA or Rotation-Invariant NCA (both use 4-filter model)
+                # rotinv_nca has same weight structure, just different perception computation
                 chn = filter_channels // 4
+                actual_chn = chn  # Store actual channel count
                 if filter_channels % 4 != 0:
                     raise ValueError(f"Expected NCA 4-filter model but filter_channels ({filter_channels}) is not divisible by 4")
 
-                # Rearrange filter channels (4 filters: id, sobelx, sobely, lap)
+                # Rearrange filter channels (4 filters: id, sobelx/rotated_x, sobely/rotated_y, lap)
                 s = layer[:, :-c].shape  # [n, 4 * chn, fc_dim]
                 # Reconstruct the layer to avoid in-place assignment issues
                 rearranged_filters = (layer[:, :-c]
@@ -172,7 +194,11 @@ def export_np_models_to_json(np_models, metadata):
                                 .transpose(0, 2, 1, 3)  # [n, 4, chn, fc_dim]
                                 .reshape(s))  # [n, 4 * chn, fc_dim]
                 layer = np.concatenate([rearranged_filters, layer[:, -c:]], axis=1)  # [n, 4 * chn + c, fc_dim]
-                print(f"NCA model layer 0: {chn} channels × 4 filters = {filter_channels} filter inputs")
+                model_type_str = metadata.get('model_type', 'nca')
+                if model_type_str == 'rotinv_nca':
+                    print(f"RotInv NCA model layer 0: {chn} channels × 4 filters = {filter_channels} filter inputs (id, rotated_x, rotated_y, lap)")
+                else:
+                    print(f"NCA model layer 0: {chn} channels × 4 filters = {filter_channels} filter inputs")
 
             # Update shape to reflect dimensions
             shape = [layer.shape[1], layer.shape[2]]  # [c_in, fc_dim]
@@ -221,7 +247,12 @@ def export_np_models_to_json(np_models, metadata):
             'bias': (i == 0),  # Only first layer has bias
         }
         models_js['layers'].append(layer_js)
-    
+
+    # Add actual channel count (before WebGL padding) to JSON
+    if actual_chn is not None:
+        models_js['channel_n'] = actual_chn
+        print(f"Actual channel count: {actual_chn}")
+
     return models_js
 
 
@@ -253,17 +284,13 @@ def convert_pt_to_json(pt_path, output_path=None, noise_level=None, pos_emb=Fals
         # Remove from state_dict so it doesn't interfere with model loading
         del state_dict['_training_params']
 
-    # Detect model type (RD or NCA)
+    # Detect model type (RD, NCA, or rotinv_nca)
     # Get channel count from w2 output dimension
     w2_shape = state_dict['w2.weight'].shape  # [chn, fc_dim, 1, 1]
     chn = w2_shape[0]
 
-    # Use model_type from training params if available, otherwise detect
-    if training_params and 'model_type' in training_params:
-        model_type = training_params['model_type']
-        print(f"Using model_type from training params: {model_type}")
-    else:
-        model_type = detect_model_type(state_dict, chn)
+    # Detect model type (checks training_params first, then uses heuristics)
+    model_type = detect_model_type(state_dict, chn, training_params)
 
     # Convert to numpy format
     np_params = torch_model_to_np(state_dict)
@@ -281,6 +308,13 @@ def convert_pt_to_json(pt_path, output_path=None, noise_level=None, pos_emb=Fals
         'pos_emb': pos_emb,
         'model_type': model_type
     }
+
+    # Add theta_channel for rotation-invariant NCA
+    if model_type == 'rotinv_nca':
+        theta_channel = 3  # Default
+        if training_params and 'theta_channel' in training_params:
+            theta_channel = training_params['theta_channel']
+        metadata['theta_channel'] = theta_channel
 
     js_models = export_np_models_to_json(np_params, metadata)
 
@@ -305,6 +339,8 @@ def convert_pt_to_json(pt_path, output_path=None, noise_level=None, pos_emb=Fals
             js_models['growing_mode'] = training_params['growing_mode']
         if 'fire_rate' in training_params:
             js_models['fire_rate'] = training_params['fire_rate']
+        if 'theta_channel' in training_params:
+            js_models['theta_channel'] = training_params['theta_channel']
     else:
         # For older models without _training_params, try to extract from state_dict
         # The diff_coef is stored as a registered buffer in the model
@@ -341,6 +377,8 @@ def convert_pt_to_json(pt_path, output_path=None, noise_level=None, pos_emb=Fals
         print(f"  - dt: {js_models['dt']}")
     if 'diff_coef' in js_models:
         print(f"  - diff_coef: {js_models['diff_coef']}")
+    if 'theta_channel' in js_models:
+        print(f"  - theta_channel: {js_models['theta_channel']}")
     print(f"  - Positional embedding: {pos_emb}")
 
     return output_path

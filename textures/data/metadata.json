@@ -71,6 +71,12 @@
     "stripes_to_bubbles",
     "horz_vert_horz",
     "leopard_zebra",
-    "leopard_zebra_puffer"
+    "leopard_zebra_puffer",
+    "noise_scales",
+    "scales_noise_scales",
+    "horz_vert_initial_noise",
+    "scales_3ch",
+    "scales_5ch",
+    "scales_4ch"
   ]
 }

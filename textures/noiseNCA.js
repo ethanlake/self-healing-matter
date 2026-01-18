@@ -286,6 +286,7 @@ const PROGRAMS = {
     uniform float u_dx, u_dy;
     uniform float u_isRD;  // 1.0 for RD models, 0.0 for NCA models
     uniform float u_growingMode;  // 1.0 for Growing NCA models (normalized Sobel filters)
+    uniform float u_channelCount;  // Actual number of channels (not padded to multiple of 4)
 
     vec4 conv3x3(vec2 xy, float inputCh, mat3 filter) {
         highp vec4 a = vec4(0.0);
@@ -295,6 +296,53 @@ const PROGRAMS = {
           a += filter[y][x] * u_input_read(p, inputCh);
         }
         return a;
+    }
+
+    // Read a single channel value from state
+    float readChannel(vec2 xy, float rawCh) {
+        float ch4 = floor(rawCh / 4.0);
+        float component = mod(rawCh, 4.0);
+        vec4 v = u_input_read(xy, ch4);
+        if (component < 0.5) return v.x;
+        else if (component < 1.5) return v.y;
+        else if (component < 2.5) return v.z;
+        else return v.w;
+    }
+
+    // Compute a single perception value for a given flat index
+    // For NCA: layout is filter-major [id0,id1,...,idN, sx0,sx1,...,sxN, sy0,...,syN, lap0,...,lapN]
+    float computePerceptionValue(vec2 xy, float percIdx, float sobelNorm) {
+        float filterBand = floor(percIdx / u_channelCount);
+        float rawChannel = mod(percIdx, u_channelCount);
+        float ch4 = floor(rawChannel / 4.0);
+        float component = mod(rawChannel, 4.0);
+
+        vec4 result;
+        if (filterBand < 0.5) {
+            // Identity filter
+            result = u_input_read(xy, ch4);
+        } else if (filterBand < 2.5) {
+            // Sobel filters with cell direction rotation
+            vec4 dx = conv3x3(xy, ch4, sobelX) / (u_dx * sobelNorm);
+            vec4 dy = conv3x3(xy, ch4, sobelY) / (u_dy * sobelNorm);
+            highp vec2 dir = getCellDirection(xy);
+            float s = dir.x, c = dir.y;
+            if (filterBand < 1.5) {
+                result = dx * c - dy * s;  // rotated sobel_x
+            } else {
+                result = dx * s + dy * c;  // rotated sobel_y
+            }
+        } else {
+            // Laplacian filter
+            mat3 lap = lapX / (u_dx * u_dx) + lapY / (u_dy * u_dy);
+            result = conv3x3(xy, ch4, lap);
+        }
+
+        // Extract the specific component
+        if (component < 0.5) return result.x;
+        else if (component < 1.5) return result.y;
+        else if (component < 2.5) return result.z;
+        else return result.w;
     }
 
     void main() {
@@ -310,14 +358,11 @@ const PROGRAMS = {
         if (ch >= u_output.depth4)
             return;
 
-
-
-        float filterBand = floor((ch+0.5)/u_input.depth4);
-        // inputCh: this is the channel idx in the original tensor
-        float inputCh = ch-filterBand*u_input.depth4;
-
         // RD model: identity and laplacian only (2 filters)
+        // Layout is filter-major: [id0,id1,...,idN, lap0,lap1,...,lapN]
         if (u_isRD > 0.5) {
+            float filterBand = floor((ch+0.5)/u_input.depth4);
+            float inputCh = ch-filterBand*u_input.depth4;
             if (filterBand < 0.5) {
                 // Identity filter
                 setOutput(u_input_read(xy, inputCh));
@@ -327,25 +372,22 @@ const PROGRAMS = {
                 setOutput(res);
             }
         } else {
-            // Standard NCA model: identity, sobel_x, sobel_y, laplacian (4 filters)
-            // Growing NCA mode: Sobel filters are normalized by 8.0 (like Growing NCA paper)
+            // NCA model: 4 filters per channel
+            // Output layout is filter-major: [id0,...,idN, sx0,...,sxN, sy0,...,syN, lap0,...,lapN]
+            // Each output texel contains 4 consecutive perception values from this flat layout
             float sobelNorm = u_growingMode > 0.5 ? 8.0 : 1.0;
 
-            if (filterBand < 0.5) {
-                // Identity filter
-                setOutput(u_input_read(xy, inputCh));
-            } else if (filterBand < 2.5) {
-                highp vec4 dx = conv3x3(xy, inputCh, sobelX) / (u_dx * sobelNorm);
-                highp vec4 dy = conv3x3(xy, inputCh, sobelY) / (u_dy * sobelNorm);
-                highp vec2 dir = getCellDirection(xy);
-                float s = dir.x, c = dir.y;
-                highp vec4 res = filterBand < 1.5 ? dx*c-dy*s: dx*s+dy*c;
-                setOutput(res);
-            } else {
-                mat3 lap = lapX / (u_dx * u_dx) + lapY / (u_dy * u_dy);
-                highp vec4 res = conv3x3(xy, inputCh, lap);
-                setOutput(res);
-            }
+            // Flat perception index for first component of this texel
+            float baseIdx = ch * 4.0;
+
+            // Compute each of the 4 components
+            highp vec4 result;
+            result.x = computePerceptionValue(xy, baseIdx + 0.0, sobelNorm);
+            result.y = computePerceptionValue(xy, baseIdx + 1.0, sobelNorm);
+            result.z = computePerceptionValue(xy, baseIdx + 2.0, sobelNorm);
+            result.w = computePerceptionValue(xy, baseIdx + 3.0, sobelNorm);
+
+            setOutput(result);
         }
     }`,
     dense: `
@@ -1037,7 +1079,10 @@ export class NoiseNCA {
 
         // Detect model type (RD or NCA) before setting up anything else
         const lastLayer = models.layers[models.layers.length - 1];
-        const channel_n = lastLayer.out_n || lastLayer.shape[1];
+        // Use channel_n from JSON if available (actual channel count before WebGL padding)
+        // Otherwise fall back to lastLayer dimensions (may be padded to multiple of 4)
+        const channel_n = models.channel_n !== undefined ? models.channel_n : (lastLayer.out_n || lastLayer.shape[1]);
+        this.channel_n = channel_n;  // Store actual channel count for perception shader
         this.modelType = detectModelType(models, channel_n);
         this.isRD = (this.modelType === 'rd');
 
@@ -1096,6 +1141,12 @@ export class NoiseNCA {
             console.log('  growingMode:', this.growingMode);
             console.log('  fireRate:', this.fireRate);
         }
+
+        // Log channel count info
+        console.log('Model channel count:', this.channel_n);
+        console.log('  channel_n from JSON:', models.channel_n);
+        console.log('  depth4 (ceil(channel_n/4)):', Math.ceil(this.channel_n / 4));
+        console.log('  perception_n (4 * channel_n):', 4 * this.channel_n);
 
         this.layers = [];
         this.altLayers = [];  // Alternate texture weights for blending
@@ -1215,7 +1266,8 @@ export class NoiseNCA {
         const updateH = this.shuffledMode ? shuffleH : gridH;
         const perception_n = this.layers[0].in_n;
         const lastLayer = this.layers[this.layers.length - 1];
-        const channel_n = lastLayer.out_n;
+        // Use this.channel_n (actual count from JSON) instead of lastLayer.out_n (may be padded)
+        const channel_n = this.channel_n;
         this.channelCount = channel_n;  // Store for external access
 
         // Initialize channel dropout mask (all active by default)
@@ -1288,6 +1340,7 @@ export class NoiseNCA {
                     u_seed: seed, u_updateProbability: this.updateProbability,
                     u_isRD: 0.0,
                     u_growingMode: this.growingMode ? 1.0 : 0.0,
+                    u_channelCount: this.channel_n,
                 });
             }
         }
@@ -1699,6 +1752,8 @@ export class NoiseNCA {
                 u_alignment: this.alignment, u_hexGrid: this.hexGrid, u_dx: this.dx, u_dy: this.dy,
                 u_seed: seed, u_updateProbability: this.updateProbability,
                 u_isRD: 0.0,
+                u_channelCount: this.channel_n,
+                u_growingMode: this.growingMode ? 1.0 : 0.0,
             });
             console.log("After perception:");
             this.debugReadBuffer('perception0');

@@ -26,32 +26,23 @@ Or if you have a virtual environment:
 
 import sys
 import os
-
+import torch
+import matplotlib.pyplot as plt
+import numpy as np
 try:
-    import torch
-except ImportError:
-    print("ERROR: PyTorch is not installed.")
-    print("\nPlease install PyTorch:")
-    print("  pip install torch")
-    print("\nOr install all requirements:")
-    print("  pip install -r requirements.txt")
-    sys.exit(1)
-
-try:
-    import matplotlib.pyplot as plt
-except ImportError:
-    print("ERROR: matplotlib is not installed.")
-    print("\nPlease install matplotlib:")
-    print("  pip install matplotlib")
-    sys.exit(1)
-
-try:
-    import numpy as np
-except ImportError:
-    print("ERROR: numpy is not installed.")
-    print("\nPlease install numpy:")
-    print("  pip install numpy")
-    sys.exit(1)
+    import matplotlib.cbook
+    if not hasattr(matplotlib.cbook, "_Stack"):
+        class _Stack(list):
+            def push(self, item):
+                self.append(item)
+                return item
+            def pop(self):
+                return super().pop() if self else None
+            def current(self):
+                return self[-1] if self else None
+        matplotlib.cbook._Stack = _Stack
+except:
+    pass
 
 
 def load_weights(pt_file):
