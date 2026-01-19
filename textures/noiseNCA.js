@@ -287,6 +287,8 @@ const PROGRAMS = {
     uniform float u_isRD;  // 1.0 for RD models, 0.0 for NCA models
     uniform float u_growingMode;  // 1.0 for Growing NCA models (normalized Sobel filters)
     uniform float u_channelCount;  // Actual number of channels (not padded to multiple of 4)
+    uniform float u_isRotInv;  // 1.0 for rotation-invariant NCA models (also set for SQZAST)
+    uniform float u_thetaChannel;  // Channel index for theta (default 3)
 
     vec4 conv3x3(vec2 xy, float inputCh, mat3 filter) {
         highp vec4 a = vec4(0.0);
@@ -321,16 +323,37 @@ const PROGRAMS = {
         if (filterBand < 0.5) {
             // Identity filter
             result = u_input_read(xy, ch4);
+            // For rotinv models, zero out the theta channel identity
+            if (u_isRotInv > 0.5 && abs(rawChannel - u_thetaChannel) < 0.5) {
+                return 0.0;
+            }
         } else if (filterBand < 2.5) {
-            // Sobel filters with cell direction rotation
+            // Sobel filters
             vec4 dx = conv3x3(xy, ch4, sobelX) / (u_dx * sobelNorm);
             vec4 dy = conv3x3(xy, ch4, sobelY) / (u_dy * sobelNorm);
-            highp vec2 dir = getCellDirection(xy);
-            float s = dir.x, c = dir.y;
-            if (filterBand < 1.5) {
-                result = dx * c - dy * s;  // rotated sobel_x
+
+            if (u_isRotInv > 0.5) {
+                // Rotation-invariant: use theta channel for rotation
+                // Python: rotated_x = cos_t * sobel_x + sin_t * sobel_y
+                //         rotated_y = -sin_t * sobel_x + cos_t * sobel_y
+                float theta = readChannel(xy, u_thetaChannel);
+                float angle = 2.0 * 3.14159265 * theta;
+                float c = cos(angle);
+                float s = sin(angle);
+                if (filterBand < 1.5) {
+                    result = dx * c + dy * s;  // rotated sobel_x
+                } else {
+                    result = -dx * s + dy * c;  // rotated sobel_y
+                }
             } else {
-                result = dx * s + dy * c;  // rotated sobel_y
+                // Standard NCA: use cell direction
+                highp vec2 dir = getCellDirection(xy);
+                float s = dir.x, c = dir.y;
+                if (filterBand < 1.5) {
+                    result = dx * c - dy * s;  // rotated sobel_x
+                } else {
+                    result = dx * s + dy * c;  // rotated sobel_y
+                }
             }
         } else {
             // Laplacian filter
@@ -545,6 +568,118 @@ const PROGRAMS = {
 
       setOutput(newState);
     }`,
+    sqzastThetaUpdate: `
+    // SQZAST fixed theta dynamics update
+    // Reads from u_input (original state with noise), computes SQZAST theta
+    // Reads from u_newState (post-learned-update) for all other channels
+    // Combines them so theta uses SQZAST rule, other channels use learned update
+    ${defInput('u_newState')}
+    uniform float u_seed;
+    uniform float u_dt;
+    uniform float u_thetaChannel;  // Which channel is theta (default 3)
+    varying vec2 uv;
+
+    void main() {
+      vec2 xy = getOutputXY();
+      float ch = getOutputChannel();
+
+      // Determine which raw channel indices are in this texel
+      float baseChIdx = ch * 4.0;
+
+      // Read post-learned-update state for non-theta channels
+      highp vec4 learnedState = u_newState_read(xy, ch);
+      // Read original state (pre-learned-update) for theta calculations
+      highp vec4 originalState = u_input_read(xy, ch);
+
+      highp vec4 newState = learnedState;  // Start with learned update
+
+      // Check if any of the 4 components in this texel is the theta channel
+      for (float i = 0.0; i < 4.0; i += 1.0) {
+        float rawCh = baseChIdx + i;
+
+        // Only process if this is the theta channel
+        if (abs(rawCh - u_thetaChannel) < 0.5) {
+          // Get original theta value at this position (before learned update)
+          float theta;
+          if (i < 0.5) theta = originalState.x;
+          else if (i < 1.5) theta = originalState.y;
+          else if (i < 2.5) theta = originalState.z;
+          else theta = originalState.w;
+
+          // SQZAST update rule:
+          // 1. Random binary mask (probability 0.5) - decides if this site updates
+          float mask = step(0.5, hash13(vec3(xy, u_seed)));
+
+          // 2. Random direction: 1=N, 2=S, 3=E, 4=W
+          float dir = floor(hash13(vec3(xy, u_seed + 100.0)) * 4.0) + 1.0;
+
+          // Get neighbor theta values from ORIGINAL state using periodic boundary
+          // North: y-1, South: y+1, East: x+1, West: x-1
+          float ch4_theta = floor(u_thetaChannel / 4.0);
+          float comp_theta = mod(u_thetaChannel, 4.0);
+
+          vec4 northVal = u_input_read(xy + vec2(0.0, -1.0), ch4_theta);
+          vec4 southVal = u_input_read(xy + vec2(0.0, 1.0), ch4_theta);
+          vec4 eastVal = u_input_read(xy + vec2(1.0, 0.0), ch4_theta);
+          vec4 westVal = u_input_read(xy + vec2(-1.0, 0.0), ch4_theta);
+
+          float theta_north, theta_south, theta_east, theta_west;
+          if (comp_theta < 0.5) {
+            theta_north = northVal.x; theta_south = southVal.x;
+            theta_east = eastVal.x; theta_west = westVal.x;
+          } else if (comp_theta < 1.5) {
+            theta_north = northVal.y; theta_south = southVal.y;
+            theta_east = eastVal.y; theta_west = westVal.y;
+          } else if (comp_theta < 2.5) {
+            theta_north = northVal.z; theta_south = southVal.z;
+            theta_east = eastVal.z; theta_west = westVal.z;
+          } else {
+            theta_north = northVal.w; theta_south = southVal.w;
+            theta_east = eastVal.w; theta_west = westVal.w;
+          }
+
+          // Compute dtheta for each direction
+          float dtheta_north = theta_north - theta;
+          float dtheta_south = theta_south - theta;
+          float dtheta_east = theta_east - theta;
+          float dtheta_west = theta_west - theta;
+
+          // step function: step(x) = 0 if x < 0, 1 otherwise
+          // For N,S: use step(-sin(2*pi*dtheta)) -> sin(2*pi*dtheta) <= 0
+          // For E,W: use step(+sin(2*pi*dtheta)) -> sin(2*pi*dtheta) >= 0
+          // Note: theta is in [0,1] representing [0, 2*pi] radians
+          float two_pi = 6.283185307179586;
+          float step_north = step(0.0, -sin(two_pi * dtheta_north));  // step(-sin(2*pi*dtheta))
+          float step_south = step(0.0, -sin(two_pi * dtheta_south));  // step(-sin(2*pi*dtheta))
+          float step_east = step(0.0, sin(two_pi * dtheta_east));     // step(+sin(2*pi*dtheta))
+          float step_west = step(0.0, sin(two_pi * dtheta_west));     // step(+sin(2*pi*dtheta))
+
+          // Compute update for each direction
+          float update_north = u_dt * dtheta_north * step_north;
+          float update_south = u_dt * dtheta_south * step_south;
+          float update_east = u_dt * dtheta_east * step_east;
+          float update_west = u_dt * dtheta_west * step_west;
+
+          // Select update based on random direction
+          float update_val = 0.0;
+          if (dir < 1.5) update_val = update_north;       // N
+          else if (dir < 2.5) update_val = update_south;  // S
+          else if (dir < 3.5) update_val = update_east;   // E
+          else update_val = update_west;                   // W
+
+          // Apply mask and update theta (from original state, not learned state)
+          float new_theta = theta + mask * update_val;
+
+          // Write back to appropriate component (overwriting learned theta)
+          if (i < 0.5) newState.x = new_theta;
+          else if (i < 1.5) newState.y = new_theta;
+          else if (i < 2.5) newState.z = new_theta;
+          else newState.w = new_theta;
+        }
+      }
+
+      setOutput(newState);
+    }`,
     blendedUpdate: `
     ${defInput('u_update')}
     ${defInput('u_altUpdate')}
@@ -738,6 +873,8 @@ const PROGRAMS = {
     uniform float u_perceptionCircle, u_arrows;
     uniform float u_viewChannel;  // -1 = RGB, -2 = grayscale, 0+ = hidden channel index
     uniform float u_invertColors;  // 1.0 = invert, 0.0 = normal
+    uniform float u_isRotInv;  // 1.0 for rotation-invariant NCA models
+    uniform float u_thetaChannel;  // Channel index for theta (default 3)
     varying vec2 uv;
 
     float clip01(float x) {
@@ -745,6 +882,13 @@ const PROGRAMS = {
     }
 
     const float PI = 3.141592653;
+
+    // HSV to RGB conversion
+    vec3 hsv2rgb(vec3 c) {
+        vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+        vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+        return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+    }
 
     float peak(float x, float r) {
         float y = x/r;
@@ -833,10 +977,19 @@ const PROGRAMS = {
                 float chIdx = floor(u_viewChannel + 0.5);
                 float ch4 = floor(chIdx / 4.0);
                 float chOffset = mod(chIdx, 4.0);
-                vec4 channelData = u_input_read01(xy, ch4);
+                vec4 channelData = u_input_read(xy, ch4);
                 float val = getElement(channelData, chOffset);
-                val = clamp(val + 0.5, 0.0, 1.0);
-                rgb = vec3(val);
+
+                // For rotinv models viewing theta channel, show as HSV color wheel
+                if (u_isRotInv > 0.5 && abs(chIdx - u_thetaChannel) < 0.5) {
+                    // theta is in range [-1, 1] (overflow loss boundary), map to hue [0, 1]
+                    // val * 0.5 + 0.5 maps [-1,1] -> [0,1]
+                    float hue = clamp(val * 0.5 + 0.5, 0.0, 1.0);
+                    rgb = hsv2rgb(vec3(hue, 1.0, 1.0));
+                } else {
+                    val = clamp(val + 0.5, 0.0, 1.0);
+                    rgb = vec3(val);
+                }
             }
             
             vec3 cellRGBOriginal = cellRGB;
@@ -1038,7 +1191,7 @@ function createDiffCoefTexture(gl, diffCoefArray) {
 }
 
 function detectModelType(models, channel_n = 12) {
-    // Detect if model is RD or NCA based on layer 0 input dimensions
+    // Detect if model is RD, NCA, rotinv_nca, or sqzast_nca based on layer 0 input dimensions
     if (!models.layers || models.layers.length < 1) {
         console.warn('No layers found in model, defaulting to NCA');
         return 'nca';
@@ -1047,6 +1200,9 @@ function detectModelType(models, channel_n = 12) {
     // Check if model_type is explicitly specified in JSON
     if (models.model_type) {
         console.log(`Model type explicitly set to: ${models.model_type}`);
+        if (models.model_type === 'sqzast_nca') {
+            console.log('  SQZAST NCA: theta channel has fixed dynamics (not learned)');
+        }
         return models.model_type;
     }
 
@@ -1085,6 +1241,9 @@ export class NoiseNCA {
         this.channel_n = channel_n;  // Store actual channel count for perception shader
         this.modelType = detectModelType(models, channel_n);
         this.isRD = (this.modelType === 'rd');
+        this.isRotInv = (this.modelType === 'rotinv_nca');
+        this.isSqzast = (this.modelType === 'sqzast_nca');
+        this.thetaChannel = models.theta_channel !== undefined ? models.theta_channel : 3;
 
         // alert(this.n_perception_scales)
 
@@ -1147,6 +1306,15 @@ export class NoiseNCA {
         console.log('  channel_n from JSON:', models.channel_n);
         console.log('  depth4 (ceil(channel_n/4)):', Math.ceil(this.channel_n / 4));
         console.log('  perception_n (4 * channel_n):', 4 * this.channel_n);
+        if (this.isRotInv) {
+            console.log('Rotation-invariant NCA model:');
+            console.log('  theta_channel:', this.thetaChannel);
+        }
+        if (this.isSqzast) {
+            console.log('SQZAST NCA model (fixed theta dynamics):');
+            console.log('  theta_channel:', this.thetaChannel);
+            console.log('  Theta update rule: stochastic quenched-zoning active spin texture');
+        }
 
         this.layers = [];
         this.altLayers = [];  // Alternate texture weights for blending
@@ -1334,6 +1502,8 @@ export class NoiseNCA {
                     u_rdStateOnly: 1.0,  // Signal to only copy state, no filters
                 });
             } else {
+                // For rotinv and sqzast models, use theta-based gradient rotation
+                const usesRotatedGradients = this.isRotInv || this.isSqzast;
                 this.runLayer(self.progs.perception, this.buf.perception0, {
                     u_input: this.buf.state, u_angle: this.rotationAngle / 180.0 * Math.PI,
                     u_alignment: this.alignment, u_hexGrid: this.hexGrid, u_dx: this.dx, u_dy: this.dy,
@@ -1341,6 +1511,8 @@ export class NoiseNCA {
                     u_isRD: 0.0,
                     u_growingMode: this.growingMode ? 1.0 : 0.0,
                     u_channelCount: this.channel_n,
+                    u_isRotInv: usesRotatedGradients ? 1.0 : 0.0,
+                    u_thetaChannel: this.thetaChannel,
                 });
             }
         }
@@ -1422,6 +1594,27 @@ export class NoiseNCA {
                     u_growingMode: this.growingMode ? 1.0 : 0.0,
                     u_fireRate: this.fireRate,
                 });
+            }
+
+            // SQZAST: Apply fixed theta dynamics AFTER the learned update
+            // This replaces the learned theta update with the SQZAST rule
+            if (this.isSqzast) {
+                // newState currently has the learned update applied to all channels
+                // We need to override the theta channel with SQZAST dynamics
+                // sqzastThetaUpdate reads:
+                //   - u_input (original state) for theta and neighbor theta values
+                //   - u_newState (post-learned) for all other channels
+                // Outputs combined state where theta uses SQZAST, others use learned
+                // Write to altUpdate as temp buffer, then copy to newState
+                this.runLayer(this.progs.sqzastThetaUpdate, this.buf.altUpdate, {
+                    u_input: this.buf.state,  // Original state (before this step's update)
+                    u_newState: this.buf.newState,  // Post-learned-update state
+                    u_seed: seed,
+                    u_dt: this.dt,
+                    u_thetaChannel: this.thetaChannel,
+                });
+                // altUpdate now has combined result, swap it into newState
+                [this.buf.newState, this.buf.altUpdate] = [this.buf.altUpdate, this.buf.newState];
             }
         }
 
@@ -1747,6 +1940,7 @@ export class NoiseNCA {
         if (this.isRD) {
             console.log("Skipping perception (RD mode - using state directly)");
         } else {
+            const usesRotatedGradients = this.isRotInv || this.isSqzast;
             this.runLayer(self.progs.perception, this.buf.perception0, {
                 u_input: this.buf.state, u_angle: this.rotationAngle / 180.0 * Math.PI,
                 u_alignment: this.alignment, u_hexGrid: this.hexGrid, u_dx: this.dx, u_dy: this.dy,
@@ -1754,6 +1948,8 @@ export class NoiseNCA {
                 u_isRD: 0.0,
                 u_channelCount: this.channel_n,
                 u_growingMode: this.growingMode ? 1.0 : 0.0,
+                u_isRotInv: usesRotatedGradients ? 1.0 : 0.0,
+                u_thetaChannel: this.thetaChannel,
             });
             console.log("After perception:");
             this.debugReadBuffer('perception0');
@@ -2471,6 +2667,8 @@ export class NoiseNCA {
             u_hexGrid: this.hexGrid,
             u_viewChannel: viewChannel,
             u_invertColors: this.invertColors ? 1.0 : 0.0,
+            u_isRotInv: (this.isRotInv || this.isSqzast) ? 1.0 : 0.0,
+            u_thetaChannel: this.thetaChannel,
         };
         let inputBuf = this.buf.state;
         if (this.visMode != 'color') {

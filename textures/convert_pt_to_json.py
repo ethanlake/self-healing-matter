@@ -50,7 +50,8 @@ def detect_model_type(state_dict, chn=12, training_params=None):
         training_params: Optional training parameters dict (may contain explicit model_type)
 
     Returns:
-        'rd' for RD models, 'nca' for NCA models, 'rotinv_nca' for rotation-invariant NCA
+        'rd' for RD models, 'nca' for NCA models, 'rotinv_nca' for rotation-invariant NCA,
+        'sqzast_nca' for SQZAST NCA (fixed theta dynamics)
     """
     # Check training params for explicit model type first
     if training_params and 'model_type' in training_params:
@@ -59,6 +60,10 @@ def detect_model_type(state_dict, chn=12, training_params=None):
             theta_channel = training_params.get('theta_channel', 3)
             print(f"Detected Rotation-Invariant NCA model (theta_channel={theta_channel})")
             return 'rotinv_nca'
+        elif model_type == 'sqzast_nca':
+            theta_channel = training_params.get('theta_channel', 3)
+            print(f"Detected SQZAST NCA model (theta_channel={theta_channel}, fixed theta dynamics)")
+            return 'sqzast_nca'
         elif model_type in ('rd', 'nca'):
             return model_type
 
@@ -150,8 +155,8 @@ def export_np_models_to_json(np_models, metadata):
         'model_type': model_type
     }
 
-    # Add theta_channel for rotation-invariant NCA models
-    if model_type == 'rotinv_nca':
+    # Add theta_channel for rotation-invariant and SQZAST NCA models
+    if model_type in ('rotinv_nca', 'sqzast_nca'):
         models_js['theta_channel'] = metadata.get('theta_channel', 3)
 
     # Track actual channel count (before padding)
@@ -197,6 +202,8 @@ def export_np_models_to_json(np_models, metadata):
                 model_type_str = metadata.get('model_type', 'nca')
                 if model_type_str == 'rotinv_nca':
                     print(f"RotInv NCA model layer 0: {chn} channels × 4 filters = {filter_channels} filter inputs (id, rotated_x, rotated_y, lap)")
+                elif model_type_str == 'sqzast_nca':
+                    print(f"SQZAST NCA model layer 0: {chn} channels × 4 filters = {filter_channels} filter inputs (id, rotated_x, rotated_y, lap) with fixed theta dynamics")
                 else:
                     print(f"NCA model layer 0: {chn} channels × 4 filters = {filter_channels} filter inputs")
 
@@ -309,8 +316,8 @@ def convert_pt_to_json(pt_path, output_path=None, noise_level=None, pos_emb=Fals
         'model_type': model_type
     }
 
-    # Add theta_channel for rotation-invariant NCA
-    if model_type == 'rotinv_nca':
+    # Add theta_channel for rotation-invariant and SQZAST NCA
+    if model_type in ('rotinv_nca', 'sqzast_nca'):
         theta_channel = 3  # Default
         if training_params and 'theta_channel' in training_params:
             theta_channel = training_params['theta_channel']

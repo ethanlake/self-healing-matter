@@ -377,18 +377,6 @@ export function createDemo(divId) {
             rdModeCheckbox.checked = ca.isRD;
         }
 
-        // Show/hide theta toggle based on whether model is rotation-invariant
-        const showThetaContainer = $('#showThetaContainer');
-        if (showThetaContainer) {
-            showThetaContainer.style.display = ca.isRotInv ? 'block' : 'none';
-        }
-        // Reset theta checkbox when loading new model
-        const showThetaCheckbox = $('#showTheta');
-        if (showThetaCheckbox) {
-            showThetaCheckbox.checked = false;
-            params.viewChannel = -1.0;  // Reset to RGB view
-        }
-
         // Populate channel checkboxes with RGB and hidden channels
         populateChannelCheckboxes();
     }
@@ -776,22 +764,6 @@ export function createDemo(divId) {
                 }
             }
         };
-
-        // Show Theta checkbox - toggles theta field visualization for rotation-invariant models
-        const showThetaCheckbox = $('#showTheta');
-        if (showThetaCheckbox) {
-            showThetaCheckbox.onchange = () => {
-                if (ca && ca.isRotInv) {
-                    if (showThetaCheckbox.checked) {
-                        // Show theta channel (channel 3 by default)
-                        params.viewChannel = ca.thetaChannel;
-                    } else {
-                        // Show RGB
-                        params.viewChannel = -1.0;
-                    }
-                }
-            };
-        }
 
         $('#zoomIn').onclick = () => {
             if (params.zoom < maxZoom) {
