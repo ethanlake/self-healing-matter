@@ -232,10 +232,11 @@ const PROGRAMS = {
     uniform float u_r;
     uniform highp vec4 u_brush;
     uniform float u_zoom;
-    
+
     uniform float u_seed;
     uniform bool u_control;
     uniform float u_noise_level;
+    uniform float u_noiseAffectsAlpha;  // 1.0 if noise should affect alpha channel
 
     void main() {
 
@@ -243,33 +244,39 @@ const PROGRAMS = {
         xy = (xy + u_output.size*(0.5)*(u_zoom-1.0))/u_zoom;
         vec2 xy_out = getOutputXY();
         if (u_hexGrid > 0.0) {
-            // vec4 r = getHex(u_pos - u_output.size*0.5);
-            // xy = r.zw + u_output.size*0.5;
             xy_out = hex2screen(xy_out - u_output.size*0.5);
             xy_out = xy_out + u_output.size*0.5;
         }
         vec2 diff = abs(xy_out-xy);
-        // diff = min(diff, u_output.size-diff); // circular padding for the brush
-        if (length(diff)*u_zoom>=u_r) 
+        if (length(diff)*u_zoom>=u_r)
           discard;
-          
+
         #ifdef SPARSE_UPDATE
             setOutput(u_brush);
-            
-        //   if (hash13(vec3(xy, u_seed)) > u_updateProbability) {
-        //     setOutput(vec4(0.0, 0.0, 0.0, 0.0));
-        //     return;
-        //   }
         #else
             if (u_control) {
                 setOutput(u_brush);
             } else {
                 float chn = getOutputChannel();
-                vec4 u = (hash44(vec4(xy_out, chn, u_seed)) - 0.5) * u_noise_level; // Random uniform in  range (-0.125, 0125)
+                vec4 u = (hash44(vec4(xy_out, chn, u_seed)) - 0.5) * u_noise_level;
+
+                // If noise shouldn't affect alpha, zero out alpha component
+                if (u_noiseAffectsAlpha < 0.5) {
+                    float baseChIdx = chn * 4.0;
+                    // Alpha is channel 3 - check if it's in this texel
+                    if (baseChIdx <= 3.0 && baseChIdx + 4.0 > 3.0) {
+                        float localIdx = 3.0 - baseChIdx;
+                        if (localIdx < 0.5) u.x = 0.0;
+                        else if (localIdx < 1.5) u.y = 0.0;
+                        else if (localIdx < 2.5) u.z = 0.0;
+                        else u.w = 0.0;
+                    }
+                }
+
                 setOutput(u);
             }
         #endif
-        
+
 
     }`,
     perception: `
@@ -398,7 +405,8 @@ const PROGRAMS = {
             // NCA model: 4 filters per channel
             // Output layout is filter-major: [id0,...,idN, sx0,...,sxN, sy0,...,syN, lap0,...,lapN]
             // Each output texel contains 4 consecutive perception values from this flat layout
-            float sobelNorm = u_growingMode > 0.5 ? 8.0 : 1.0;
+            // All NCA models (including Growing NCA) use unnormalized Sobel filters
+            float sobelNorm = 1.0;
 
             // Flat perception index for first component of this texel
             float baseIdx = ch * 4.0;
@@ -522,49 +530,84 @@ const PROGRAMS = {
     uniform float u_dt;
     uniform float u_growingMode;  // 1.0 for Growing NCA (stochastic fire_rate=0.5)
     uniform float u_fireRate;     // Stochastic update rate (default 0.5 for growing mode)
+    uniform float u_noiseAffectsAlpha;  // 1.0 if noise should affect alpha channel
     varying vec2 uv;
+
+    #ifdef USE_LIFE_MASK
+    // Life mask helper: get alpha from state at any position
+    float getAlphaAt(vec2 pos) {
+        // Alpha is channel 3 (stored in ch=0, component w for channels 0-3 packed)
+        vec4 state0 = u_input_read(pos, 0.0);
+        return state0.w;  // Alpha is 4th component of first pack
+    }
+
+    // Check if cell is alive: any neighbor in 3x3 has alpha > 0.1
+    float getPreLifeMask(vec2 pos) {
+        float maxAlpha = 0.0;
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                maxAlpha = max(maxAlpha, getAlphaAt(pos + vec2(float(dx), float(dy))));
+            }
+        }
+        return step(0.1, maxAlpha);  // 1.0 if any neighbor has alpha > 0.1
+    }
+    #endif
 
     void main() {
       vec2 xy = getOutputXY();
-    //   if (xy.y>100.0 && xy.y < 150.0) {
-    //       xy.x -= 1.0;
-    //   }
       float ch = getOutputChannel();
-      highp vec4 state = u_input_read(xy, ch); //u_input_readUV(uv);
+      highp vec4 state = u_input_read(xy, ch);
       highp vec4 update = vec4(0.0);
+
+      #ifdef USE_LIFE_MASK
+      // Compute pre-life mask (before update)
+      float preMask = getPreLifeMask(xy);
+      #endif
+
       #ifdef SPARSE_UPDATE
         vec4 shuffleInfo = texture2D(u_unshuffleTex, fract((xy-u_shuffleOfs)/u_output.size));
         if (shuffleInfo.z > 0.5) {
-            // update = u_update_read(shuffleInfo.xy*255.0+0.5, getOutputChannel());
             update = u_update_read(shuffleInfo.xy + 0.5, getOutputChannel());
-            // update = u_update_read(shuffleInfo.xy*(HW.x - 1.0)+0.5, getOutputChannel());
         }
       #else
-        // if (hash13(vec3(xy, u_seed)) <= u_updateProbability) {
         update = u_update_readUV(uv);
-        // }
       #endif
+
       // Noise with sqrt(dt) scaling for correct continuum limit (SDE Euler-Maruyama)
-      // noise ~ epsilon * sqrt(dt) * uniform[-1, 1]
       highp vec4 noise = (hash44(vec4(xy, ch, u_seed)) - 0.5) * 2.0 * u_epsilon * sqrt(u_dt);
+
+      // If noise shouldn't affect alpha, zero out alpha component
+      if (u_noiseAffectsAlpha < 0.5) {
+          float baseChIdx = ch * 4.0;
+          // Alpha is channel 3 - check if it's in this texel
+          if (baseChIdx <= 3.0 && baseChIdx + 4.0 > 3.0) {
+              float localIdx = 3.0 - baseChIdx;
+              if (localIdx < 0.5) noise.x = 0.0;
+              else if (localIdx < 1.5) noise.y = 0.0;
+              else if (localIdx < 2.5) noise.z = 0.0;
+              else noise.w = 0.0;
+          }
+      }
+
       highp vec4 newState = state + u_dt * update + noise;
 
       // Growing NCA: stochastic cell updates (fire_rate = 0.5)
-      // Only some cells update each step - helps prevent runaway dynamics
       if (u_growingMode > 0.5) {
-          // Use spatial hash to determine if this cell fires
-          // Only channel 0 decides (same mask for all channels at this pixel)
           float fireRoll = hash13(vec3(xy, u_seed));
           if (fireRoll > u_fireRate) {
-              // This cell doesn't fire - keep original state
-              newState = state;
+              newState = state;  // This cell doesn't fire
           }
       }
+
+      #ifdef USE_LIFE_MASK
+      // Apply life mask: cells die if no living neighbors (alpha > 0.1)
+      newState = newState * preMask;
+      #endif
 
       // Apply channel dropout mask
       float ch4 = ch;
       vec4 maskVec = texture2D(u_dropoutMask, vec2((ch4 + 0.5) / u_dropoutMask_size.x, 0.5));
-      newState = newState * maskVec;  // Multiply by mask (0.0 = dropped out)
+      newState = newState * maskVec;
 
       setOutput(newState);
     }`,
@@ -690,32 +733,70 @@ const PROGRAMS = {
     uniform float u_blendFactor;
     uniform float u_growingMode;  // 1.0 for Growing NCA (stochastic fire_rate=0.5)
     uniform float u_fireRate;     // Stochastic update rate (default 0.5 for growing mode)
+    uniform float u_noiseAffectsAlpha;  // 1.0 if noise should affect alpha channel
     varying vec2 uv;
+
+    #ifdef USE_LIFE_MASK
+    float getAlphaAt(vec2 pos) {
+        vec4 state0 = u_input_read(pos, 0.0);
+        return state0.w;
+    }
+    float getPreLifeMask(vec2 pos) {
+        float maxAlpha = 0.0;
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                maxAlpha = max(maxAlpha, getAlphaAt(pos + vec2(float(dx), float(dy))));
+            }
+        }
+        return step(0.1, maxAlpha);
+    }
+    #endif
 
     void main() {
       vec2 xy = getOutputXY();
       float ch = getOutputChannel();
       highp vec4 state = u_input_read(xy, ch);
+
+      #ifdef USE_LIFE_MASK
+      float preMask = getPreLifeMask(xy);
+      #endif
+
       highp vec4 update1 = u_update_readUV(uv);
       highp vec4 update2 = u_altUpdate_readUV(uv);
-      // Blend the two updates: (1-blend)*update1 + blend*update2
       highp vec4 blendedUpdate = mix(update1, update2, u_blendFactor);
-      // Noise with sqrt(dt) scaling for correct continuum limit (SDE Euler-Maruyama)
+
       highp vec4 noise = (hash44(vec4(xy, ch, u_seed)) - 0.5) * 2.0 * u_epsilon * sqrt(u_dt);
+
+      // If noise shouldn't affect alpha, zero out alpha component
+      if (u_noiseAffectsAlpha < 0.5) {
+          float baseChIdx = ch * 4.0;
+          if (baseChIdx <= 3.0 && baseChIdx + 4.0 > 3.0) {
+              float localIdx = 3.0 - baseChIdx;
+              if (localIdx < 0.5) noise.x = 0.0;
+              else if (localIdx < 1.5) noise.y = 0.0;
+              else if (localIdx < 2.5) noise.z = 0.0;
+              else noise.w = 0.0;
+          }
+      }
+
       highp vec4 newState = state + u_dt * blendedUpdate + noise;
 
-      // Growing NCA: stochastic cell updates (fire_rate = 0.5)
+      // Growing NCA: stochastic cell updates
       if (u_growingMode > 0.5) {
           float fireRoll = hash13(vec3(xy, u_seed));
           if (fireRoll > u_fireRate) {
-              newState = state;  // This cell doesn't fire
+              newState = state;
           }
       }
+
+      #ifdef USE_LIFE_MASK
+      newState = newState * preMask;
+      #endif
 
       // Apply channel dropout mask
       float ch4 = ch;
       vec4 maskVec = texture2D(u_dropoutMask, vec2((ch4 + 0.5) / u_dropoutMask_size.x, 0.5));
-      newState = newState * maskVec;  // Multiply by mask (0.0 = dropped out)
+      newState = newState * maskVec;
 
       setOutput(newState);
     }`,
@@ -875,6 +956,9 @@ const PROGRAMS = {
     uniform float u_invertColors;  // 1.0 = invert, 0.0 = normal
     uniform float u_isRotInv;  // 1.0 for rotation-invariant NCA models
     uniform float u_thetaChannel;  // Channel index for theta (default 3)
+    uniform float u_growingMode;  // 1.0 for Growing NCA models (use alpha for blending)
+    uniform float u_visScale;     // Scale for auto-scaling visualization
+    uniform float u_visOffset;    // Offset for auto-scaling visualization
     varying vec2 uv;
 
     float clip01(float x) {
@@ -962,7 +1046,23 @@ const PROGRAMS = {
                 fp = r.xy;
             }
 
-            vec3 cellRGB = clamp(u_input_read(xy, 0.0).rgb + 0.5, 0.0, 1.0);
+            vec4 cellRGBA = u_input_read(xy, 0.0);
+            vec3 cellRGB;
+
+            // For Growing NCA models:
+            // These models store values in [0, 1] range directly (NO +0.5 offset)
+            // The notebook display formula is: output = clamp(1.0 - alpha + rgb, 0, 1)
+            // where rgb is premultiplied by alpha during training
+            if (u_growingMode > 0.5) {
+                // Apply auto-scale if enabled (u_visScale != 1.0 or u_visOffset != 0.0)
+                vec4 rgba = cellRGBA * u_visScale + u_visOffset;
+                rgba = clamp(rgba, 0.0, 1.0);
+                // Apply to_rgb formula: output = 1.0 - alpha + rgb
+                cellRGB = clamp(vec3(1.0 - rgba.a) + rgba.rgb, 0.0, 1.0);
+            } else {
+                // Standard texture NCA: apply scale/offset (default: scale=1, offset=0.5)
+                cellRGB = clamp(cellRGBA.rgb * u_visScale + u_visOffset, 0.0, 1.0);
+            }
 
             vec3 rgb;
             if (u_viewChannel < -1.5) {
@@ -987,7 +1087,8 @@ const PROGRAMS = {
                     float hue = clamp(val * 0.5 + 0.5, 0.0, 1.0);
                     rgb = hsv2rgb(vec3(hue, 1.0, 1.0));
                 } else {
-                    val = clamp(val + 0.5, 0.0, 1.0);
+                    // Apply auto-scale: val * scale + offset
+                    val = clamp(val * u_visScale + u_visOffset, 0.0, 1.0);
                     rgb = vec3(val);
                 }
             }
@@ -1193,7 +1294,7 @@ function createDiffCoefTexture(gl, diffCoefArray) {
 function detectModelType(models, channel_n = 12) {
     // Detect if model is RD, NCA, rotinv_nca, or sqzast_nca based on layer 0 input dimensions
     if (!models.layers || models.layers.length < 1) {
-        console.warn('No layers found in model, defaulting to NCA');
+        console.warn('No layers found in model, defaulting to NCA. models object:', models);
         return 'nca';
     }
 
@@ -1268,6 +1369,8 @@ export class NoiseNCA {
         this.hexGrid = false;
         this.viewChannel = -1.0;  // -1 = RGB, -2 = grayscale, 0+ = hidden channel index
         this.invertColors = false;
+        this.autoScaleVis = false;  // Auto-scale visualization based on actual min/max
+        this.visScaleOffset = { scale: 1.0, offset: 0.5 };  // Computed scale/offset for visualization
 
         this.noise_level = models.noise_level;
 
@@ -1282,6 +1385,16 @@ export class NoiseNCA {
         // Detected from model JSON or can be set manually
         this.growingMode = models.growing_mode || false;
         this.fireRate = models.fire_rate !== undefined ? models.fire_rate : 0.5;
+
+        // Growing NCA specific features
+        this.useLifeMask = models.use_life_mask || false;  // Alpha-based life mask
+        this.zeroPadding = models.zero_padding || false;   // Zero padding vs circular
+        this.noiseAffectsAlpha = models.noise_affects_alpha || false;  // Whether noise affects alpha channel
+
+        // Override circular_padding if zeroPadding is enabled
+        if (this.zeroPadding) {
+            this.circular_padding = false;
+        }
 
         // Log hyperparameters if RD model
         if (this.isRD) {
@@ -1299,6 +1412,9 @@ export class NoiseNCA {
             console.log('Growing NCA mode enabled:');
             console.log('  growingMode:', this.growingMode);
             console.log('  fireRate:', this.fireRate);
+            console.log('  useLifeMask:', this.useLifeMask);
+            console.log('  zeroPadding:', this.zeroPadding);
+            console.log('  noiseAffectsAlpha:', this.noiseAffectsAlpha);
         }
 
         // Log channel count info
@@ -1345,7 +1461,8 @@ export class NoiseNCA {
         this.setWeights(models);
 
         const defs = (this.circular_padding ? '#define CIRCULAR_PADDING\n' : '') +
-            (this.shuffledMode ? '#define SPARSE_UPDATE\n' : '');
+            (this.shuffledMode ? '#define SPARSE_UPDATE\n' : '') +
+            (this.useLifeMask ? '#define USE_LIFE_MASK\n' : '');
 
 
         this.progs = createPrograms(gl, defs);
@@ -1582,6 +1699,7 @@ export class NoiseNCA {
                     u_dropoutMask_size: [Math.ceil(this.channelCount / 4), 1],
                     u_growingMode: this.growingMode ? 1.0 : 0.0,
                     u_fireRate: this.fireRate,
+                    u_noiseAffectsAlpha: this.noiseAffectsAlpha ? 1.0 : 0.0,
                 });
             } else {
                 // Use regular update shader (no blending)
@@ -1593,6 +1711,7 @@ export class NoiseNCA {
                     u_dropoutMask_size: [Math.ceil(this.channelCount / 4), 1],
                     u_growingMode: this.growingMode ? 1.0 : 0.0,
                     u_fireRate: this.fireRate,
+                    u_noiseAffectsAlpha: this.noiseAffectsAlpha ? 1.0 : 0.0,
                 });
             }
 
@@ -1718,6 +1837,7 @@ export class NoiseNCA {
             u_seed: u_seed,
             u_control: false,
             u_noise_level: noiseLevel,
+            u_noiseAffectsAlpha: this.noiseAffectsAlpha ? 1.0 : 0.0,
         });
     }
 
@@ -1897,6 +2017,98 @@ export class NoiseNCA {
     setRDMode(isRD) {
         this.isRD = isRD;
         console.log(`RD Mode ${isRD ? 'enabled' : 'disabled'}`);
+    }
+
+    // Compute min/max of RGB channels for auto-scaling visualization
+    // Returns { min, max } for channels 0-2 (RGB) or specific channel if viewing hidden
+    computeVisMinMax() {
+        const gl = this.gl;
+        const buf = this.buf.state;
+
+        twgl.bindFramebufferInfo(gl, buf.fbi);
+        const data = new Float32Array(buf.fbi.width * buf.fbi.height * 4);
+        gl.readPixels(0, 0, buf.fbi.width, buf.fbi.height, gl.RGBA, gl.FLOAT, data);
+
+        // Unbind framebuffer and restore viewport to canvas size
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+
+        const [w, h] = this.gridSize;
+        const depth4 = Math.ceil(this.channelCount / 4);
+        const gridW = Math.ceil(Math.sqrt(depth4));
+
+        let min = Infinity, max = -Infinity;
+        let sum = 0, count = 0;
+
+        // Determine which channels to analyze
+        let channelsToCheck;
+        if (this.viewChannel >= 0) {
+            // Viewing a specific hidden channel
+            channelsToCheck = [Math.floor(this.viewChannel)];
+        } else {
+            // Viewing RGB (channels 0, 1, 2)
+            channelsToCheck = [0, 1, 2];
+        }
+
+        // For each channel we want to check
+        for (const ch of channelsToCheck) {
+            const ch4 = Math.floor(ch / 4);
+            const chOffset = ch % 4;
+            const tileX = ch4 % gridW;
+            const tileY = Math.floor(ch4 / gridW);
+
+            // Iterate over all pixels in this channel's tile
+            for (let y = 0; y < h; y++) {
+                for (let x = 0; x < w; x++) {
+                    const texX = tileX * w + x;
+                    const texY = tileY * h + y;
+                    const texIdx = (texY * buf.fbi.width + texX) * 4 + chOffset;
+                    const val = data[texIdx];
+
+                    if (!isNaN(val) && isFinite(val)) {
+                        min = Math.min(min, val);
+                        max = Math.max(max, val);
+                        sum += val;
+                        count++;
+                    }
+                }
+            }
+        }
+
+        const mean = count > 0 ? sum / count : 0;
+        return { min, max, mean };
+    }
+
+    // Update scale/offset for auto-scaling visualization
+    updateVisScaleOffset() {
+        if (!this.autoScaleVis) {
+            // Reset to default (for non-growing: offset=0.5, scale=1.0)
+            if (this.growingMode) {
+                this.visScaleOffset = { scale: 1.0, offset: 0.0 };
+            } else {
+                this.visScaleOffset = { scale: 1.0, offset: 0.5 };
+            }
+            return;
+        }
+
+        const { min, max } = this.computeVisMinMax();
+
+        if (min === Infinity || max === -Infinity || min === max) {
+            // No valid data or all same value
+            this.visScaleOffset = { scale: 1.0, offset: this.growingMode ? 0.0 : 0.5 };
+            return;
+        }
+
+        // We want to map [min, max] -> [0, 1]
+        // output = (input - min) / (max - min)
+        // output = input * scale + offset
+        // scale = 1 / (max - min)
+        // offset = -min / (max - min)
+        const range = max - min;
+        const scale = 1.0 / range;
+        const offset = -min / range;
+
+        this.visScaleOffset = { scale, offset };
     }
 
     // Debug: read buffer values and print stats
@@ -2604,7 +2816,7 @@ export class NoiseNCA {
         const gl = this.gl;
 
         // Check if alt model type matches primary model type
-        const altModelType = models.model_type || detectModelType(models.layers, this.channelCount);
+        const altModelType = models.model_type || detectModelType(models, this.channelCount);
         const altIsRD = (altModelType === 'rd');
 
         if (altIsRD !== this.isRD) {
@@ -2656,6 +2868,9 @@ export class NoiseNCA {
         zoom = zoom || 1.0;
         viewChannel = viewChannel !== undefined ? viewChannel : -1.0;  // default RGB
 
+        // Update visualization scale/offset if auto-scale is enabled
+        this.updateVisScaleOffset();
+
         gl.useProgram(this.progs.vis.program);
         twgl.setBuffersAndAttributes(gl, this.progs.vis, this.quad);
         const uniforms = {
@@ -2669,6 +2884,9 @@ export class NoiseNCA {
             u_invertColors: this.invertColors ? 1.0 : 0.0,
             u_isRotInv: (this.isRotInv || this.isSqzast) ? 1.0 : 0.0,
             u_thetaChannel: this.thetaChannel,
+            u_growingMode: this.growingMode ? 1.0 : 0.0,
+            u_visScale: this.visScaleOffset.scale,
+            u_visOffset: this.visScaleOffset.offset,
         };
         let inputBuf = this.buf.state;
         if (this.visMode != 'color') {

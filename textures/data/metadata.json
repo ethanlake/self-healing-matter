@@ -80,6 +80,8 @@
     "scales_4ch",
     "rotinv_scales",
     "rotinv_stripes",
-    "sqz_stripes"
+    "sqz_stripes",
+    "octopus",
+    "monkey"
   ]
 }

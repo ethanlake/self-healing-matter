@@ -188,8 +188,13 @@ def main():
     # Image folder depends on category
     image_subdir = 'texture' if args.category == 'textures' else 'object'
     image_dir = os.path.join(script_dir, 'data', 'images', image_subdir)
-    # Always save as .jpg for consistency with demo
-    image_target = os.path.join(image_dir, f"{args.model_name}.jpg")
+
+    # Growing-NCA models need PNG to preserve alpha channel
+    if args.model_type == 'Growing-NCA':
+        image_target = os.path.join(image_dir, f"{args.model_name}.png")
+    else:
+        # Save as .jpg for consistency with demo
+        image_target = os.path.join(image_dir, f"{args.model_name}.jpg")
 
     # Weights folder: trained_models/<category>/<model_type>/<model_name>/
     # e.g., trained_models/Objects/Noise-NCA/my_model/ or trained_models/Noise-NCA/my_model/
@@ -234,7 +239,7 @@ def main():
     os.makedirs(weights_dir, exist_ok=True)
     os.makedirs(models_dir, exist_ok=True)
 
-    # Create/convert image to JPG
+    # Create/convert image
     if args.noise_controlled:
         # Create hybrid image from multiple inputs
         print(f"Creating hybrid image from {len(args.images)} images...")
@@ -246,8 +251,21 @@ def main():
         except Exception as e:
             print(f"Error creating hybrid image: {e}")
             sys.exit(1)
+    elif args.model_type == 'Growing-NCA':
+        # Growing-NCA: keep RGBA, save as PNG
+        print(f"Saving image to {image_target}...")
+        try:
+            img = Image.open(args.image)
+            # Convert to RGBA if not already (Growing NCA needs alpha)
+            if img.mode != 'RGBA':
+                img = img.convert('RGBA')
+            img.save(image_target, 'PNG')
+            print(f"✓ Image saved as PNG (with alpha channel)")
+        except Exception as e:
+            print(f"Error saving image: {e}")
+            sys.exit(1)
     else:
-        # Single image mode
+        # Single image mode - convert to JPG
         print(f"Converting image to {image_target}...")
         try:
             img = Image.open(args.image)
@@ -270,11 +288,16 @@ def main():
     print(f"Converting weights to JSON...")
     try:
         # Build command with optional flags
-        convert_cmd = ['python3', convert_script, weights_target, json_target]
+        # Pass model name explicitly since input path is weights.pt
+        convert_cmd = ['python3', convert_script, weights_target, json_target, '--model-name', args.model_name]
 
-        # Object models (from nca_experiments.ipynb) use Growing NCA mode
-        # with normalized Sobel filters and stochastic fire_rate=0.5
-        if args.category == 'objects':
+        # Growing-NCA models use Growing NCA mode with normalized Sobel filters,
+        # stochastic fire_rate=0.5, life mask, and zero padding
+        if args.model_type == 'Growing-NCA':
+            convert_cmd.append('--growing-mode')
+            print("  Adding --growing-mode flag for Growing-NCA model")
+        # Object models (from nca_experiments.ipynb) also use Growing NCA mode
+        elif args.category == 'objects':
             convert_cmd.append('--growing-mode')
             print("  Adding --growing-mode flag for object model")
 

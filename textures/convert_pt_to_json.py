@@ -263,7 +263,7 @@ def export_np_models_to_json(np_models, metadata):
     return models_js
 
 
-def convert_pt_to_json(pt_path, output_path=None, noise_level=None, pos_emb=False, dt=None, growing_mode=False):
+def convert_pt_to_json(pt_path, output_path=None, noise_level=None, pos_emb=False, dt=None, growing_mode=False, model_name=None):
     """
     Convert a PyTorch .pt file to JSON format for NoiseNCA.
 
@@ -274,6 +274,7 @@ def convert_pt_to_json(pt_path, output_path=None, noise_level=None, pos_emb=Fals
         pos_emb: Whether the model uses positional embedding
         dt: Timestep for RD models (if not in model)
         growing_mode: Enable Growing NCA mode (normalized Sobel, stochastic updates)
+        model_name: Model name to use in JSON (default: extracted from pt_path or output_path)
 
     Returns:
         Path to the created JSON file
@@ -306,8 +307,12 @@ def convert_pt_to_json(pt_path, output_path=None, noise_level=None, pos_emb=Fals
     if noise_level is not None:
         np_params[-1] = noise_level
 
-    # Extract model name from filename
-    model_name = os.path.splitext(os.path.basename(pt_path))[0]
+    # Determine model name: use explicit param, or extract from output_path, or fallback to pt_path
+    if model_name is None:
+        if output_path:
+            model_name = os.path.splitext(os.path.basename(output_path))[0]
+        else:
+            model_name = os.path.splitext(os.path.basename(pt_path))[0]
 
     # Export to JSON format
     metadata = {
@@ -348,6 +353,14 @@ def convert_pt_to_json(pt_path, output_path=None, noise_level=None, pos_emb=Fals
             js_models['fire_rate'] = training_params['fire_rate']
         if 'theta_channel' in training_params:
             js_models['theta_channel'] = training_params['theta_channel']
+        # Growing NCA specific settings from training
+        if training_params.get('model_type') == 'growing_nca':
+            js_models['growing_mode'] = True
+            js_models['use_life_mask'] = True
+            js_models['zero_padding'] = True
+            js_models['fire_rate'] = training_params.get('fire_rate', 0.5)
+            js_models['noise_affects_alpha'] = training_params.get('noise_affects_alpha', False)
+            print(f"Detected Growing NCA model from training params")
     else:
         # For older models without _training_params, try to extract from state_dict
         # The diff_coef is stored as a registered buffer in the model
@@ -364,7 +377,14 @@ def convert_pt_to_json(pt_path, output_path=None, noise_level=None, pos_emb=Fals
     if growing_mode:
         js_models['growing_mode'] = True
         js_models['fire_rate'] = 0.5  # Default fire_rate for Growing NCA
-        print(f"Growing NCA mode enabled: normalized Sobel filters, fire_rate=0.5")
+        js_models['use_life_mask'] = True  # Growing NCA uses alpha-based life mask
+        js_models['zero_padding'] = False  # Use periodic boundaries in the demo
+        # Check training params for noise_affects_alpha setting
+        if training_params and 'noise_affects_alpha' in training_params:
+            js_models['noise_affects_alpha'] = training_params['noise_affects_alpha']
+        else:
+            js_models['noise_affects_alpha'] = False  # Default: noise doesn't affect alpha
+        print(f"Growing NCA mode enabled: normalized Sobel filters, fire_rate=0.5, life_mask=True, periodic boundaries")
 
     # Determine output path
     if output_path is None:
@@ -403,6 +423,8 @@ def main():
     parser.add_argument('--dt', type=float, help='Timestep value for RD models (default from model or 0.5)')
     parser.add_argument('--growing-mode', action='store_true',
                        help='Enable Growing NCA mode (normalized Sobel filters, stochastic fire_rate=0.5)')
+    parser.add_argument('--model-name', type=str,
+                       help='Model name to use in JSON (default: extracted from output filename)')
 
     args = parser.parse_args()
 
@@ -411,7 +433,7 @@ def main():
         sys.exit(1)
 
     try:
-        convert_pt_to_json(args.input, args.output, args.noise_level, args.pos_emb, args.dt, args.growing_mode)
+        convert_pt_to_json(args.input, args.output, args.noise_level, args.pos_emb, args.dt, args.growing_mode, args.model_name)
     except Exception as e:
         print(f"Error: {e}")
         import traceback

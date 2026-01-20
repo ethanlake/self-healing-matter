@@ -345,6 +345,9 @@
                         <label style="cursor: pointer;">
                             <input type="checkbox" id="invertColors"> Invert Colors
                         </label>
+                        <label style="cursor: pointer;" title="Auto-scale visualization based on actual min/max values">
+                            <input type="checkbox" id="autoScaleVis"> Auto-Scale Colors
+                        </label>
                         <label style="display: flex; align-items: center; gap: 8px;">
                             Blend Factor: <input type="range" id="blendFactor" min="0" max="1" step="0.01" value="0" style="width: 100px;">
                             <span id="blendFactorLabel">0.00</span>
@@ -375,6 +378,20 @@
                             <button id="resetNeuronPruning" style="padding: 4px 12px; cursor: pointer;">
                                 Reset Neuron Pruning
                             </button>
+                        </label>
+                    </div>
+
+                    <!-- Growing NCA Settings -->
+                    <div style="text-align: center; padding: 8px; grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 15px; border-top: 1px solid #eee; margin-top: 5px; padding-top: 10px;">
+                        <span style="font-weight: bold; margin-right: 10px;">Growing NCA:</span>
+                        <label style="cursor: pointer;" title="Whether noise (epsilon slider and brush) affects the alpha channel">
+                            <input type="checkbox" id="noiseAffectsAlpha"> Noise Affects Alpha
+                        </label>
+                        <label style="cursor: pointer;" title="Alpha-based life mask (cells die if no living neighbors) - set by model">
+                            <input type="checkbox" id="useLifeMask" disabled> Life Mask
+                        </label>
+                        <label style="cursor: pointer;" title="Zero padding boundaries (vs periodic/circular) - set by model">
+                            <input type="checkbox" id="zeroPadding" disabled> Zero Padding
                         </label>
                     </div>
 

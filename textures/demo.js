@@ -1,5 +1,48 @@
 import {NoiseNCA} from './noiseNCA.js'
 
+// Helper to check if a URL exists (returns the URL if found, null otherwise)
+async function findFirstExistingPath(paths) {
+    for (const path of paths) {
+        try {
+            const response = await fetch(path, { method: 'HEAD' });
+            if (response.ok) {
+                return path;
+            }
+        } catch (e) {
+            // Path doesn't exist, try next
+        }
+    }
+    return null;
+}
+
+// Helper that tries to load image with fallback paths
+// Used for texture grid where we don't want to block
+function loadImageWithFallback(paths, element) {
+    let currentIdx = 0;
+
+    function tryNext() {
+        if (currentIdx >= paths.length) {
+            console.warn('All image paths failed:', paths);
+            return;
+        }
+        const path = paths[currentIdx];
+        // Create a fresh Image object for each attempt
+        const img = new Image();
+        img.onload = () => {
+            element.style.background = "url('" + path + "')";
+            element.style.backgroundSize = "100% 100%";
+            element.dataset.imagePath = path;  // Store the working path
+        };
+        img.onerror = () => {
+            currentIdx++;
+            tryNext();
+        };
+        img.src = path;
+    }
+
+    tryNext();
+}
+
 function isInViewport(element) {
     var rect = element.getBoundingClientRect();
     var html = document.documentElement;
@@ -84,9 +127,15 @@ export function createDemo(divId) {
         altTextureIdx: 0,
         blendFactor: 0.0,
         invertColors: false,
+        autoScaleVis: false,  // Auto-scale visualization based on actual min/max
 
         // Weight perturbation
         weightPerturbation: 0.0,
+
+        // Growing NCA settings
+        noiseAffectsAlpha: false,  // Whether noise affects alpha channel
+        useLifeMask: false,         // Alpha-based life mask
+        zeroPadding: false,         // Zero padding (vs circular/periodic)
 
         // Weight pruning
         weightPruningFraction: 0.0,
@@ -151,13 +200,23 @@ export function createDemo(divId) {
         // let texture_images = metadata['texture_images'];
 
         // Helper function to get image path based on category
-        function getImagePath(name, category = 'texture') {
-            // For blue_spiral, use .jpeg, otherwise try .jpg
+        // Returns array of paths to try (most models use .jpg, but Growing-NCA uses .png)
+        function getImagePaths(name, category = 'texture') {
+            // For blue_spiral, use .jpeg
             if (name === "blue_spiral") {
-                return "data/images/texture/" + name + ".jpeg";
+                return ["data/images/texture/" + name + ".jpeg"];
             }
             const subdir = category === 'object' ? 'object' : 'texture';
-            return "data/images/" + subdir + "/" + name + ".jpg";
+            // Try .jpg first (most common), then .png (for Growing-NCA with alpha)
+            return [
+                "data/images/" + subdir + "/" + name + ".jpg",
+                "data/images/" + subdir + "/" + name + ".png"
+            ];
+        }
+
+        // Legacy helper - returns first available path (jpg)
+        function getImagePath(name, category = 'texture') {
+            return getImagePaths(name, category)[0];
         }
 
         // Legacy helper for backwards compatibility
@@ -174,8 +233,17 @@ export function createDemo(divId) {
         async function setTextureModel(idx) {
             const model = allModels[idx];
             params.texture_name = model.name;
-            params.texture_img = getImagePath(model.name, model.category);
             params.texture_category = model.category;
+
+            // Try to get the already-resolved image path from the texture grid element
+            const textureElement = document.getElementById(model.name);
+            if (textureElement && textureElement.dataset.imagePath) {
+                params.texture_img = textureElement.dataset.imagePath;
+            } else {
+                // Fallback: try multiple image paths
+                const imagePaths = getImagePaths(model.name, model.category);
+                params.texture_img = await findFirstExistingPath(imagePaths) || imagePaths[0];
+            }
 
             params.modelSet = "data/models/" + model.name + ".json"
             params.texture_idx = idx;
@@ -230,10 +298,10 @@ export function createDemo(divId) {
 
         for (let idx = 0; idx < len; idx++) {
             const model = allModels[idx];
-            let media_path = getImagePath(model.name, model.category);
+            const imagePaths = getImagePaths(model.name, model.category);
 
             if (model.name === 'blue_spiral') {
-                console.log('Processing blue_spiral at index', idx, 'with path:', media_path);
+                console.log('Processing blue_spiral at index', idx, 'with paths:', imagePaths);
             }
 
             // Add a separator before the first object model
@@ -246,18 +314,16 @@ export function createDemo(divId) {
             }
 
             const texture = document.createElement('div');
-            texture.style.background = "url('" + media_path + "')";
-            texture.style.backgroundSize = "100%100%";
-            // texture.style.backgroundSize = "100px100px";
+            // Start with first path, will be updated by loadImageWithFallback if needed
+            texture.style.background = "url('" + imagePaths[0] + "')";
+            texture.style.backgroundSize = "100% 100%";
             texture.id = model.name; //html5 support arbitrary id:s
             texture.className = 'texture-square';
             texture.dataset.category = model.category;  // Store category for init type auto-selection
-            // Add error handling for image loading
-            const img = new Image();
-            img.onerror = () => {
-                console.warn('Failed to load model image:', media_path);
-            };
-            img.src = media_path;
+            texture.dataset.imagePath = imagePaths[0];  // Will be updated by fallback
+
+            // Try loading image with fallback to alternative extensions
+            loadImageWithFallback(imagePaths, texture);
             texture.onclick = () => {
                 // removeOverlayIcon();
                 console.log('Model clicked, selectingAltTexture:', selectingAltTexture, 'idx:', idx);
@@ -282,16 +348,7 @@ export function createDemo(divId) {
                         texture.scrollIntoView({behavior: "smooth", block: "nearest", inline: "center"})
                     }
                     setTextureModel(idx);
-
-                    // Auto-select appropriate init type based on category
-                    const initTypeSelect = $('#initType');
-                    if (initTypeSelect) {
-                        if (model.category === 'object') {
-                            initTypeSelect.value = 'center_seed';
-                        } else {
-                            initTypeSelect.value = 'uniform';
-                        }
-                    }
+                    // Note: init type is auto-selected in createCA() based on growing_mode
                 }
             };
             let gridBox = $('#texture');
@@ -368,6 +425,7 @@ export function createDemo(divId) {
         ca.rotationAngle = params.rotationAngle;
         ca.blendFactor = params.blendFactor;
         ca.invertColors = params.invertColors;
+        ca.autoScaleVis = params.autoScaleVis;
         ca.weightPruningFraction = params.weightPruningFraction;
         ca.neuronPruningFraction = params.neuronPruningFraction;
 
@@ -376,6 +434,53 @@ export function createDemo(divId) {
         if (rdModeCheckbox) {
             rdModeCheckbox.checked = ca.isRD;
         }
+
+        // Sync Growing NCA settings from model
+        if (params.models.growing_mode) {
+            params.noiseAffectsAlpha = params.models.noise_affects_alpha || false;
+            params.useLifeMask = params.models.use_life_mask !== false;  // Default true for growing
+            params.zeroPadding = params.models.zero_padding || false;    // Default false (periodic boundaries)
+
+            // Update UI checkboxes if they exist
+            const noiseAlphaCheckbox = $('#noiseAffectsAlpha');
+            if (noiseAlphaCheckbox) noiseAlphaCheckbox.checked = params.noiseAffectsAlpha;
+
+            const lifeMaskCheckbox = $('#useLifeMask');
+            if (lifeMaskCheckbox) lifeMaskCheckbox.checked = params.useLifeMask;
+
+            const zeroPadCheckbox = $('#zeroPadding');
+            if (zeroPadCheckbox) zeroPadCheckbox.checked = params.zeroPadding;
+
+            // Auto-select center seed initialization for growing models
+            const initTypeSelect = $('#initType');
+            if (initTypeSelect) {
+                initTypeSelect.value = 'center_seed';
+            }
+
+            // Initialize with center seed
+            ca.initCenterSeed();
+        } else {
+            // Non-growing model - reset settings
+            params.noiseAffectsAlpha = false;
+            params.useLifeMask = false;
+            params.zeroPadding = false;
+
+            const noiseAlphaCheckbox = $('#noiseAffectsAlpha');
+            if (noiseAlphaCheckbox) noiseAlphaCheckbox.checked = false;
+
+            const lifeMaskCheckbox = $('#useLifeMask');
+            if (lifeMaskCheckbox) lifeMaskCheckbox.checked = false;
+
+            const zeroPadCheckbox = $('#zeroPadding');
+            if (zeroPadCheckbox) zeroPadCheckbox.checked = false;
+
+            // Set uniform init type for non-growing models
+            const initTypeSelect = $('#initType');
+            if (initTypeSelect) {
+                initTypeSelect.value = 'uniform';
+            }
+        }
+        ca.noiseAffectsAlpha = params.noiseAffectsAlpha;
 
         // Populate channel checkboxes with RGB and hidden channels
         populateChannelCheckboxes();
@@ -751,6 +856,14 @@ export function createDemo(divId) {
             }
         };
 
+        // Auto-scale visualization checkbox
+        $('#autoScaleVis').onchange = () => {
+            params.autoScaleVis = $('#autoScaleVis').checked;
+            if (ca) {
+                ca.autoScaleVis = params.autoScaleVis;
+            }
+        };
+
         // RD Mode checkbox - enables Reaction-Diffusion mode
         $('#rdMode').onchange = () => {
             const isRD = $('#rdMode').checked;
@@ -764,6 +877,37 @@ export function createDemo(divId) {
                 }
             }
         };
+
+        // Growing NCA settings
+        // Noise affects alpha checkbox
+        const noiseAlphaCheckbox = $('#noiseAffectsAlpha');
+        if (noiseAlphaCheckbox) {
+            noiseAlphaCheckbox.onchange = () => {
+                params.noiseAffectsAlpha = noiseAlphaCheckbox.checked;
+                if (ca) {
+                    ca.noiseAffectsAlpha = params.noiseAffectsAlpha;
+                }
+            };
+        }
+
+        // Note: Life mask and zero padding require shader recompilation
+        // so they can only be changed when the model is loaded (from JSON)
+        // The checkboxes are informational only for now
+        const lifeMaskCheckbox = $('#useLifeMask');
+        if (lifeMaskCheckbox) {
+            lifeMaskCheckbox.onchange = () => {
+                params.useLifeMask = lifeMaskCheckbox.checked;
+                console.log('Life mask setting changed - requires model reload to take effect');
+            };
+        }
+
+        const zeroPadCheckbox = $('#zeroPadding');
+        if (zeroPadCheckbox) {
+            zeroPadCheckbox.onchange = () => {
+                params.zeroPadding = zeroPadCheckbox.checked;
+                console.log('Zero padding setting changed - requires model reload to take effect');
+            };
+        }
 
         $('#zoomIn').onclick = () => {
             if (params.zoom < maxZoom) {
@@ -840,6 +984,7 @@ export function createDemo(divId) {
     let frameCount = 0;
 
     let first = true;
+    let lastMinMaxLogTime = 0;
 
     function render(time) {
         if (!isInViewport(canvas)) {
@@ -859,6 +1004,7 @@ export function createDemo(divId) {
         ca.dx = params.dx;
         ca.dy = params.dy;
         ca.epsilon = params.epsilon;
+        ca.noiseAffectsAlpha = params.noiseAffectsAlpha;
         // ca.hexGrid = params.hexGrid;
 
         if (!paused) {
@@ -886,6 +1032,15 @@ export function createDemo(divId) {
 
         twgl.bindFramebufferInfo(gl);
         ca.draw(params.zoom, params.viewChannel);
+
+        // Log min/max/mean of current view channel every 2 seconds
+        if (time - lastMinMaxLogTime > 2000) {
+            lastMinMaxLogTime = time;
+            const { min, max, mean } = ca.computeVisMinMax();
+            const channelDesc = params.viewChannel < 0 ? 'RGB' : `channel ${params.viewChannel}`;
+            console.log(`[${channelDesc}] min: ${min.toFixed(4)}, max: ${max.toFixed(4)}, mean: ${mean.toFixed(4)}`);
+        }
+
         requestAnimationFrame(render);
     }
 }
