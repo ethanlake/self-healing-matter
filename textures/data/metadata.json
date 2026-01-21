@@ -82,6 +82,8 @@
     "rotinv_stripes",
     "sqz_stripes",
     "octopus",
-    "monkey"
+    "monkey",
+    "scales_lightweight",
+    "horz_noise_vert"
   ]
 }

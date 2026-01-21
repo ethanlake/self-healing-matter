@@ -431,7 +431,12 @@ const PROGRAMS = {
     uniform highp vec2 grid_size;
     uniform bool bias, pos_emb, relu;
     uniform float u_isRD;  // 1.0 for RD models, 0.0 for NCA models
-    
+
+    // Neuron mask for disabling individual neurons
+    uniform sampler2D u_neuronMask;
+    uniform float u_applyNeuronMask;  // 1.0 to apply mask, 0.0 to skip
+    uniform float u_maskWidth;        // Width of mask texture
+
     const float MAX_PACKED_DEPTH = 32.0;
     
     vec4 readWeightUnscaled(vec2 p) {
@@ -520,6 +525,16 @@ const PROGRAMS = {
         // ReLU activation (same for both NCA and RD models)
         result = max(result, 0.0);
       }
+
+      // Apply neuron mask if enabled (multiply each neuron by its mask value)
+      if (u_applyNeuronMask > 0.5) {
+        // ch is the output channel pack (0, 1, 2, ...), each pack has 4 neurons
+        // Read the mask values for the 4 neurons in this pack
+        float maskTexX = (ch + 0.5) / u_maskWidth;
+        vec4 maskVec = texture2D(u_neuronMask, vec2(maskTexX, 0.5));
+        result = result * maskVec;
+      }
+
       setOutput(result);
     }`,
     update: `
@@ -1396,6 +1411,10 @@ export class NoiseNCA {
             this.circular_padding = false;
         }
 
+        // Neuron mask for disabling individual neurons in layer 0
+        this.neuronMask = null;      // null = all enabled, Float32Array = per-neuron mask (1=enabled, 0=disabled)
+        this.neuronMaskTex = null;   // GPU texture for shader
+
         // Log hyperparameters if RD model
         if (this.isRD) {
             console.log('RD Model hyperparameters from JSON:');
@@ -1642,7 +1661,7 @@ export class NoiseNCA {
         for (let i = 0; i < this.layers.length; ++i) {
             if (stage == 'all' || stage == `FC Layer${i + 1}`)
                 var relu = i == 0 ? true : false;
-            this.runDense(this.buf[`layer${i}`], inputBuf, this.layers[i], relu, seed);
+            this.runDense(this.buf[`layer${i}`], inputBuf, this.layers[i], relu, seed, i);
             inputBuf = this.buf[`layer${i}`];
         }
         
@@ -2111,6 +2130,101 @@ export class NoiseNCA {
         this.visScaleOffset = { scale, offset };
     }
 
+    // Compute average activation for each neuron in layer 0 (hidden layer)
+    // Returns Float32Array of length neuronCount, or null if layer0 buffer doesn't exist
+    computeNeuronActivations() {
+        const gl = this.gl;
+        const buf = this.buf.layer0;
+        if (!buf || !this.layers || this.layers.length === 0) return null;
+
+        // Read GPU buffer
+        twgl.bindFramebufferInfo(gl, buf.fbi);
+        const data = new Float32Array(buf.fbi.width * buf.fbi.height * 4);
+        gl.readPixels(0, 0, buf.fbi.width, buf.fbi.height, gl.RGBA, gl.FLOAT, data);
+
+        // Unbind framebuffer and restore viewport
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+
+        const neuronCount = this.layers[0].out_n;  // typically 96
+        const [w, h] = this.gridSize;
+        const depth4 = Math.ceil(neuronCount / 4);
+        const gridW = Math.ceil(Math.sqrt(depth4));
+
+        const activations = new Float32Array(neuronCount);
+        const pixelCount = w * h;
+
+        // Sum activations for each neuron across all spatial positions
+        for (let neuron = 0; neuron < neuronCount; neuron++) {
+            const ch4 = Math.floor(neuron / 4);
+            const chOffset = neuron % 4;
+            const tileX = ch4 % gridW;
+            const tileY = Math.floor(ch4 / gridW);
+
+            let sum = 0;
+            for (let y = 0; y < h; y++) {
+                for (let x = 0; x < w; x++) {
+                    const texX = tileX * w + x;
+                    const texY = tileY * h + y;
+                    const texIdx = (texY * buf.fbi.width + texX) * 4 + chOffset;
+                    const val = data[texIdx];
+                    if (!isNaN(val) && isFinite(val)) {
+                        sum += val;
+                    }
+                }
+            }
+            activations[neuron] = sum / pixelCount;
+        }
+
+        return activations;
+    }
+
+    // Set whether a specific neuron in layer 0 is enabled or disabled
+    setNeuronEnabled(neuronIdx, enabled) {
+        if (!this.layers || this.layers.length === 0) return;
+
+        const neuronCount = this.layers[0].out_n;
+        if (neuronIdx < 0 || neuronIdx >= neuronCount) return;
+
+        // Initialize mask if needed (all neurons enabled by default)
+        if (!this.neuronMask) {
+            this.neuronMask = new Float32Array(neuronCount).fill(1.0);
+        }
+
+        this.neuronMask[neuronIdx] = enabled ? 1.0 : 0.0;
+        this.updateNeuronMaskTexture();
+    }
+
+    // Reset neuron mask (re-enable all neurons)
+    resetNeuronMask() {
+        this.neuronMask = null;
+        // Don't need to delete texture, just won't use it
+    }
+
+    // Create or update the GPU texture for the neuron mask
+    updateNeuronMaskTexture() {
+        if (!this.neuronMask) return;
+
+        const gl = this.gl;
+
+        // Create texture if needed
+        if (!this.neuronMaskTex) {
+            this.neuronMaskTex = gl.createTexture();
+        }
+
+        // Pack mask into 1D texture (width = ceil(neuronCount/4))
+        const width = Math.ceil(this.neuronMask.length / 4);
+        const padded = new Float32Array(width * 4);
+        padded.set(this.neuronMask);
+
+        gl.bindTexture(gl.TEXTURE_2D, this.neuronMaskTex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, width, 1, 0, gl.RGBA, gl.FLOAT, padded);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    }
+
     // Debug: read buffer values and print stats
     debugReadBuffer(bufName = 'state') {
         const gl = this.gl;
@@ -2171,7 +2285,7 @@ export class NoiseNCA {
         let inputBuf = this.isRD ? this.buf.state : this.buf.perception0;
         for (let i = 0; i < this.layers.length; i++) {
             const relu = i === 0;
-            this.runDense(this.buf[`layer${i}`], inputBuf, this.layers[i], relu, seed);
+            this.runDense(this.buf[`layer${i}`], inputBuf, this.layers[i], relu, seed, i);
             console.log(`After layer${i} (relu=${relu}):`);
             this.debugReadBuffer(`layer${i}`);
             inputBuf = this.buf[`layer${i}`];
@@ -2852,21 +2966,35 @@ export class NoiseNCA {
         return {programName: program.name, output}
     }
 
-    runDense(output, input, layer, relu = false, seed = 0) {
-        return this.runLayer(this.progs.dense, output, {
+    runDense(output, input, layer, relu = false, seed = 0, layerIdx = -1) {
+        const uniforms = {
             u_input: input, u_control: this.buf.control,
             u_weightTex: layer.tex, u_weightCoefs: layer.coefs, u_layout: layer.layout,
             u_seed: seed, u_fuzz: this.fuzz, u_updateProbability: this.updateProbability,
             bias: layer.bias, pos_emb: layer.pos_emb, relu: relu,
             grid_size: this.gridSize, u_angle: this.rotationAngle / 180.0 * Math.PI,
             u_isRD: this.isRD ? 1.0 : 0.0,
-        });
+            u_applyNeuronMask: 0.0,
+            u_maskWidth: 1.0,
+        };
+
+        // Apply neuron mask only for layer 0 (hidden layer) when mask is set
+        if (layerIdx === 0 && this.neuronMask && this.neuronMaskTex) {
+            uniforms.u_neuronMask = this.neuronMaskTex;
+            uniforms.u_applyNeuronMask = 1.0;
+            uniforms.u_maskWidth = Math.ceil(this.neuronMask.length / 4);
+        }
+
+        return this.runLayer(this.progs.dense, output, uniforms);
     }
 
     draw(zoom, viewChannel) {
         const gl = this.gl;
         zoom = zoom || 1.0;
         viewChannel = viewChannel !== undefined ? viewChannel : -1.0;  // default RGB
+
+        // Store viewChannel so computeVisMinMax knows which channel to analyze
+        this.viewChannel = viewChannel;
 
         // Update visualization scale/offset if auto-scale is enabled
         this.updateVisScaleOffset();

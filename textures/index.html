@@ -94,6 +94,87 @@
         .channel-checkbox-label:hover {
             color: #007bff;
         }
+
+        /* Neuron activation sidebar */
+        #neuron-sidebar {
+            position: fixed;
+            right: 0;
+            top: 50%;
+            transform: translateY(-50%);
+            z-index: 1000;
+            display: flex;
+            flex-direction: row;
+        }
+
+        #neuron-sidebar.collapsed .sidebar-content {
+            display: none;
+        }
+
+        #neuron-toggle {
+            writing-mode: vertical-rl;
+            text-orientation: mixed;
+            padding: 15px 8px;
+            background: rgba(30, 30, 50, 0.95);
+            border: 1px solid #555;
+            border-right: none;
+            border-radius: 8px 0 0 8px;
+            color: white;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: bold;
+        }
+
+        #neuron-toggle:hover {
+            background: rgba(50, 50, 80, 0.95);
+        }
+
+        .sidebar-content {
+            background: rgba(30, 30, 50, 0.95);
+            border: 1px solid #555;
+            border-right: none;
+            border-radius: 8px 0 0 8px;
+            padding: 15px;
+            color: white;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+
+        .sidebar-content h4 {
+            margin: 0 0 10px 0;
+            font-size: 14px;
+            color: #ccc;
+        }
+
+        #neuron-canvas {
+            border: 1px solid #555;
+            cursor: pointer;
+            display: block;
+            background: #1a1a2e;
+            width: 500px;
+            height: 800px;
+        }
+
+        #neuron-info, #disabled-count {
+            font-size: 11px;
+            color: #888;
+            margin: 5px 0;
+        }
+
+        #reset-neurons {
+            margin-top: 10px;
+            padding: 6px 12px;
+            background: #555;
+            border: none;
+            color: white;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            width: 100%;
+        }
+
+        #reset-neurons:hover {
+            background: #666;
+        }
     </style>
 
 </head>
@@ -140,6 +221,17 @@
 
 <body>
 
+    <!-- Neuron Activation Sidebar -->
+    <div id="neuron-sidebar" class="collapsed">
+        <button id="neuron-toggle">Neurons</button>
+        <div class="sidebar-content">
+            <h4>Hidden Layer Activations</h4>
+            <canvas id="neuron-canvas" width="500" height="800"></canvas>
+            <div id="neuron-info">Click bar to toggle neuron</div>
+            <div id="disabled-count">Disabled: 0</div>
+            <button id="reset-neurons">Reset All Neurons</button>
+        </div>
+    </div>
 
     <section class="section is-light">
         <div class="container is-max-desktop">

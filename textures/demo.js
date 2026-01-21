@@ -65,6 +65,9 @@ export function createDemo(divId) {
     let paused = false;
     let recording = false;
 
+    // Neuron activation visualization state (declared early for use in createCA)
+    let disabledNeurons = new Set();
+
     const canvas = $('#demo-canvas');
     canvas.width = W * 6; //so we can render hexells
     canvas.height = H * 6;
@@ -416,6 +419,11 @@ export function createDemo(divId) {
 
     function createCA() {
         ca = new NoiseNCA(gl, params.models, [W, H], gui, params.our_version);
+
+        // Reset disabled neurons when switching models
+        disabledNeurons.clear();
+        const disabledCountEl = document.getElementById('disabled-count');
+        if (disabledCountEl) disabledCountEl.textContent = 'Disabled: 0';
 
         ca.paint(0, 0, 10000, 0, [0.5, 0.5]);
 
@@ -966,6 +974,7 @@ export function createDemo(divId) {
         if (firstTime) {
             createGUI(models);
             initUI();
+            initNeuronPanel();
             updateUI();
             updateDx();
             updateDy();
@@ -985,6 +994,121 @@ export function createDemo(divId) {
 
     let first = true;
     let lastMinMaxLogTime = 0;
+
+    // Neuron activation visualization
+    let neuronCanvas = null;
+    let neuronCtx = null;
+    let lastNeuronUpdate = 0;
+    const NEURON_UPDATE_INTERVAL = 100;  // ms between updates (10 fps)
+    let neuronActivations = null;
+    // Note: disabledNeurons is declared earlier near other state variables
+
+    function initNeuronPanel() {
+        const sidebar = document.getElementById('neuron-sidebar');
+        const toggle = document.getElementById('neuron-toggle');
+        neuronCanvas = document.getElementById('neuron-canvas');
+        const resetBtn = document.getElementById('reset-neurons');
+
+        if (!sidebar || !toggle || !neuronCanvas || !resetBtn) {
+            console.warn('Neuron panel elements not found');
+            return;
+        }
+
+        neuronCtx = neuronCanvas.getContext('2d');
+
+        // Toggle sidebar
+        toggle.addEventListener('click', () => {
+            sidebar.classList.toggle('collapsed');
+        });
+
+        // Reset all neurons button
+        resetBtn.addEventListener('click', () => {
+            disabledNeurons.clear();
+            if (ca) ca.resetNeuronMask();
+            document.getElementById('disabled-count').textContent = 'Disabled: 0';
+        });
+
+        // Click handler for toggling neurons (vertical layout)
+        neuronCanvas.addEventListener('click', (e) => {
+            if (!neuronActivations || !ca) return;
+            const rect = neuronCanvas.getBoundingClientRect();
+            const y = e.clientY - rect.top;
+            const barHeight = neuronCanvas.height / neuronActivations.length;
+            const neuronIdx = Math.floor(y / barHeight);
+
+            if (neuronIdx >= 0 && neuronIdx < neuronActivations.length) {
+                if (disabledNeurons.has(neuronIdx)) {
+                    disabledNeurons.delete(neuronIdx);
+                    ca.setNeuronEnabled(neuronIdx, true);
+                } else {
+                    disabledNeurons.add(neuronIdx);
+                    ca.setNeuronEnabled(neuronIdx, false);
+                }
+                document.getElementById('disabled-count').textContent = `Disabled: ${disabledNeurons.size}`;
+            }
+        });
+    }
+
+    function drawNeuronActivations(activations) {
+        if (!neuronCtx || !neuronCanvas) return;
+
+        const ctx = neuronCtx;
+        const width = neuronCanvas.width;
+        const height = neuronCanvas.height;
+
+        ctx.fillStyle = '#1a1a2e';
+        ctx.fillRect(0, 0, width, height);
+
+        const n = activations.length;
+        const barHeight = height / n;
+        const maxAbs = Math.max(...Array.from(activations).map(Math.abs), 0.01);
+        const midX = width / 2;
+
+        for (let i = 0; i < n; i++) {
+            const val = activations[i];
+            const barWidth = (val / maxAbs) * (width / 2 - 20);
+
+            // Color: blue for negative, orange for positive, grey for disabled
+            if (disabledNeurons.has(i)) {
+                ctx.fillStyle = '#444';
+            } else if (val >= 0) {
+                const brightness = 50 + (val / maxAbs) * 30;
+                ctx.fillStyle = `hsl(30, 80%, ${brightness}%)`;  // orange
+            } else {
+                const brightness = 50 + (Math.abs(val) / maxAbs) * 30;
+                ctx.fillStyle = `hsl(210, 80%, ${brightness}%)`;  // blue
+            }
+
+            // Draw horizontal bar from center
+            const barX = val >= 0 ? midX : midX + barWidth;
+            ctx.fillRect(barX, i * barHeight + 1, Math.abs(barWidth), barHeight - 2);
+
+            // Draw neuron index on left
+            ctx.fillStyle = '#666';
+            ctx.font = '9px monospace';
+            ctx.fillText(i.toString(), 2, i * barHeight + barHeight / 2 + 3);
+        }
+
+        // Draw zero line (vertical center)
+        ctx.strokeStyle = '#666';
+        ctx.beginPath();
+        ctx.moveTo(midX, 0);
+        ctx.lineTo(midX, height);
+        ctx.stroke();
+    }
+
+    function updateNeuronPanel(time) {
+        const sidebar = document.getElementById('neuron-sidebar');
+        if (!sidebar || sidebar.classList.contains('collapsed')) return;
+        if (time - lastNeuronUpdate < NEURON_UPDATE_INTERVAL) return;
+        if (!ca) return;
+
+        lastNeuronUpdate = time;
+        neuronActivations = ca.computeNeuronActivations();
+        if (neuronActivations) {
+            drawNeuronActivations(neuronActivations);
+        }
+    }
 
     function render(time) {
         if (!isInViewport(canvas)) {
@@ -1033,12 +1157,19 @@ export function createDemo(divId) {
         twgl.bindFramebufferInfo(gl);
         ca.draw(params.zoom, params.viewChannel);
 
+        // Update neuron activation panel if open
+        updateNeuronPanel(time);
+
         // Log min/max/mean of current view channel every 2 seconds
         if (time - lastMinMaxLogTime > 2000) {
             lastMinMaxLogTime = time;
             const { min, max, mean } = ca.computeVisMinMax();
             const channelDesc = params.viewChannel < 0 ? 'RGB' : `channel ${params.viewChannel}`;
-            console.log(`[${channelDesc}] min: ${min.toFixed(4)}, max: ${max.toFixed(4)}, mean: ${mean.toFixed(4)}`);
+            const { scale, offset } = ca.visScaleOffset;
+            const displayMin = min * scale + offset;
+            const displayMax = max * scale + offset;
+            const displayMean = mean * scale + offset;
+            console.log(`[${channelDesc}] raw: min=${min.toFixed(4)}, max=${max.toFixed(4)}, mean=${mean.toFixed(4)} | display: min=${displayMin.toFixed(4)}, max=${displayMax.toFixed(4)}, mean=${displayMean.toFixed(4)} (scale=${scale.toFixed(4)}, offset=${offset.toFixed(4)})`);
         }
 
         requestAnimationFrame(render);
