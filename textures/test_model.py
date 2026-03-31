@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+import math
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
@@ -121,8 +122,26 @@ def main():
                         help='Frames per second for animation (default: 30)')
     parser.add_argument('--skip', type=int, default=1,
                         help='Show every Nth frame (default: 1)')
+    parser.add_argument('--epl', type=float, default=0.0,
+                        help='Noise level at left edge (default: 0)')
+    parser.add_argument('--epr', type=float, default=0.0,
+                        help='Noise level at right edge (default: 0)')
+    parser.add_argument('--aspect', type=float, default=1.0,
+                        help='Aspect ratio for rectangular grid (height = size * aspect, default: 1)')
+    parser.add_argument('--open', action='store_true',
+                        help='Use open boundary conditions (clamp boundaries to zero)')
+    parser.add_argument('--dx', type=float, default=1.0,
+                        help='Spatial scale factor for dx and dy (default: 1.0)')
+    parser.add_argument('--dt', type=float, default=None,
+                        help='Time step scale factor (default: dx^2)')
+    parser.add_argument('--last_half', action='store_true',
+                        help='Only save the second half of the animation (requires --save)')
 
     args = parser.parse_args()
+
+    # Default dt to dx^2 if not specified
+    if args.dt is None:
+        args.dt = args.dx ** 2
 
     # Default epf to epi if not specified
     if args.epf is None:
@@ -166,11 +185,36 @@ def main():
     model = model.to(device)
     model.eval()
 
-    print(f"Running {args.steps} steps with noise={args.epi} -> {args.epf} (hold_frac={args.hold_frac})")
+    # Compute grid dimensions
+    grid_h = args.size
+    grid_w = int(args.size * args.aspect)
+
+    # Check if using spatial noise gradient
+    use_spatial_noise = (args.epl != 0.0 or args.epr != 0.0)
+
+    if use_spatial_noise:
+        print(f"Running {args.steps} steps with spatial noise: epl={args.epl}, epr={args.epr}")
+    else:
+        print(f"Running {args.steps} steps with noise={args.epi} -> {args.epf} (hold_frac={args.hold_frac})")
+
+    if args.aspect != 1.0:
+        print(f"Using rectangular grid: {grid_h} x {grid_w} (aspect={args.aspect})")
+
+    if args.open:
+        print("Using open boundary conditions (boundaries clamped to zero)")
+
+    if args.dx != 1.0 or args.dt != 1.0:
+        print(f"Using dx=dy={args.dx}, dt={args.dt} (noise scaled by sqrt(dt)={math.sqrt(args.dt):.4f})")
 
     # Initialize state
     with torch.no_grad():
-        s = model.seed(1, args.size, args.size).to(device)
+        s = model.seed(1, grid_h, grid_w).to(device)
+        # Initialize boundaries to zero if using open boundary conditions
+        if args.open:
+            s[:, :, 0, :] = 0.0   # Top row
+            s[:, :, -1, :] = 0.0  # Bottom row
+            s[:, :, :, 0] = 0.0   # Left column
+            s[:, :, :, -1] = 0.0  # Right column
 
     # Compute noise level as a function of time
     def get_noise_level(t, steps, epi, epf, hold_frac):
@@ -186,34 +230,91 @@ def main():
             alpha = (t - t_start) / (t_end - t_start)
             return epi + alpha * (epf - epi)
 
+    # Create spatial noise field if using epl/epr
+    if use_spatial_noise:
+        # Create a tensor that linearly interpolates from epl to epr across width
+        # Shape: [1, 1, 1, grid_w] for broadcasting with [b, c, h, w]
+        x_coords = torch.linspace(0, 1, grid_w, device=device)
+        spatial_noise = args.epl + (args.epr - args.epl) * x_coords
+        spatial_noise = spatial_noise.reshape(1, 1, 1, grid_w)  # [1, 1, 1, w]
+
+    # Helper function to apply open boundary conditions
+    def apply_open_boundaries(state):
+        """Clamp all boundary pixels to zero."""
+        state[:, :, 0, :] = 0.0   # Top row
+        state[:, :, -1, :] = 0.0  # Bottom row
+        state[:, :, :, 0] = 0.0   # Left column
+        state[:, :, :, -1] = 0.0  # Right column
+        return state
+
     # Collect frames
     frames = []
     noise_levels = []
     with torch.no_grad():
         for step in range(args.steps):
-            noise = get_noise_level(step, args.steps, args.epi, args.epf, args.hold_frac)
-            s = model(s, noise=noise)
+            if use_spatial_noise:
+                # Use spatially varying noise (scaled by sqrt(dt))
+                noise_scale = math.sqrt(args.dt)
+                s = s + torch.randn_like(s) * spatial_noise * noise_scale
+                z = model.perception(s, dx=args.dx, dy=args.dx)
+                delta_s = model.w2(torch.relu(model.w1(z)))
+                s = s + delta_s * args.dt
+                noise_for_display = (args.epl + args.epr) / 2  # Average for display
+            else:
+                noise = get_noise_level(step, args.steps, args.epi, args.epf, args.hold_frac)
+                # Scale noise by sqrt(dt)
+                scaled_noise = noise * math.sqrt(args.dt)
+                s = model(s, dx=args.dx, dy=args.dx, dt=args.dt, noise=scaled_noise)
+                noise_for_display = noise
+
+            # Apply open boundary conditions if enabled
+            if args.open:
+                s = apply_open_boundaries(s)
+
             if step % args.skip == 0:
                 rgb = to_rgb(s)[0].permute(1, 2, 0).cpu().numpy()
                 rgb = np.clip(rgb, 0, 1)
                 frames.append(rgb)
-                noise_levels.append(noise)
+                noise_levels.append(noise_for_display)
             if step % 100 == 0:
                 print(f"  Step {step}/{args.steps}")
 
     print(f"Collected {len(frames)} frames")
 
-    # Create animation
-    fig, ax = plt.subplots(figsize=(6, 6))
+    # Use only the second half of frames if --last_half is specified
+    if args.last_half:
+        half_idx = len(frames) // 2
+        frames = frames[half_idx:]
+        noise_levels = noise_levels[half_idx:]
+        print(f"Using last half: {len(frames)} frames")
+
+    # Create animation with appropriate figure size for aspect ratio
+    fig_width = 6 * args.aspect
+    fig_height = 6
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
     ax.axis('off')
 
     im = ax.imshow(frames[0])
 
-    title = ax.set_title(r'$\epsilon = %.2f$' % noise_levels[0], fontsize=32, pad=20)
+    if use_spatial_noise:
+        title_text = r'$\epsilon_L = %.2f, \epsilon_R = %.2f$' % (args.epl, args.epr)
+        if args.open:
+            title_text += ' (open BC)'
+        title = ax.set_title(title_text, fontsize=24, pad=20)
+    else:
+        title_text = r'$\epsilon = %.2f$' % noise_levels[0]
+        if args.open:
+            title = ax.set_title(title_text + ' (open BC)', fontsize=28, pad=20)
+        else:
+            title = ax.set_title(title_text, fontsize=32, pad=20)
 
     def update(frame_idx):
         im.set_array(frames[frame_idx])
-        title.set_text(r'$\epsilon = %.2f$' % noise_levels[frame_idx])
+        if not use_spatial_noise:
+            new_title = r'$\epsilon = %.2f$' % noise_levels[frame_idx]
+            if args.open:
+                new_title += ' (open BC)'
+            title.set_text(new_title)
         return [im, title]
 
     ani = animation.FuncAnimation(

@@ -84,6 +84,7 @@
     "octopus",
     "monkey",
     "scales_lightweight",
-    "horz_noise_vert"
+    "horz_noise_vert",
+    "spiral_shell"
   ]
 }
